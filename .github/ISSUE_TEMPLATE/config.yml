@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Domande generali
+    url: https://github.com/tonythewizard/fresh-fan-manager/discussions
+    about: Per domande, idee, o discussioni generali usa le Discussions invece delle Issues.

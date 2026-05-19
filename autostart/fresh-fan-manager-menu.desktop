@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fresh Fan Manager
+GenericName=Fan & Temperature Monitor
+Comment=Monitor temperatura, ventola e CPU/GPU per MacBook su Linux
+Exec=/usr/local/bin/fresh-fan-manager
+Icon=fresh-fan-manager
+Terminal=false
+Categories=System;Monitor;
+StartupNotify=true
+StartupWMClass=Fresh Fan Manager

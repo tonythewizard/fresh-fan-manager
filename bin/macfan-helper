@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""
+macfan-helper — privileged operations dispatcher.
+
+Invoked by the GUI through pkexec. All subcommands are intentionally narrow
+in scope and validate their inputs. This file lives at /usr/local/bin/macfan-helper
+and is referenced by /usr/share/polkit-1/actions/org.macfan.monitor.policy
+"""
+from __future__ import annotations
+
+import os
+import sys
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+MBPFAN_CONF = Path("/etc/mbpfan.conf")
+SMC_PATH = Path("/sys/devices/platform/applesmc.768")
+CPU_BASE = Path("/sys/devices/system/cpu")
+
+ALLOWED_GOVERNORS = {"performance", "powersave", "ondemand",
+                     "conservative", "schedutil", "userspace"}
+
+
+def _die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def cmd_write_conf() -> int:
+    """Read new config text from stdin, validate, write atomically."""
+    data = sys.stdin.read()
+    if not data.strip():
+        _die("empty input")
+    # Very light validation: must contain at least 'low_temp' or '[general]'
+    if "low_temp" not in data and "[general]" not in data:
+        _die("does not look like mbpfan.conf")
+    # Reject anything funky
+    if len(data) > 8192:
+        _die("config too large")
+    # Atomic replace
+    tmp = MBPFAN_CONF.with_suffix(".tmp")
+    tmp.write_text(data)
+    os.replace(tmp, MBPFAN_CONF)
+    os.chmod(MBPFAN_CONF, 0o644)
+    print("ok")
+    return 0
+
+
+def _restart_with_reset(unit: str = "mbpfan") -> tuple[int, str, str]:
+    """Reset-failed + restart, retrying once if systemd start-limit was hit."""
+    # Always clear any previous failure state first (cheap, ignores errors).
+    subprocess.run(["systemctl", "reset-failed", unit],
+                   capture_output=True, text=True)
+    r = subprocess.run(["systemctl", "restart", unit],
+                       capture_output=True, text=True)
+    if r.returncode != 0 and ("start-limit" in (r.stdout + r.stderr).lower()
+                              or "too often" in (r.stdout + r.stderr).lower()):
+        # Hit the burst limit — do a hard reset and try once more
+        subprocess.run(["systemctl", "reset-failed", unit],
+                       capture_output=True, text=True)
+        r = subprocess.run(["systemctl", "restart", unit],
+                           capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr
+
+
+def cmd_restart_mbpfan() -> int:
+    rc, out, err = _restart_with_reset("mbpfan")
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    return rc
+
+
+def cmd_enable_mbpfan() -> int:
+    r = subprocess.run(["systemctl", "enable", "mbpfan"],
+                       capture_output=True, text=True)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    return r.returncode
+
+
+def cmd_install_mbpfan() -> int:
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    r = subprocess.run(["apt-get", "update"], capture_output=True, text=True, env=env)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        return r.returncode
+    r = subprocess.run(["apt-get", "install", "-y", "mbpfan"],
+                       capture_output=True, text=True, env=env)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    return r.returncode
+
+
+def cmd_set_governor(name: str) -> int:
+    if name not in ALLOWED_GOVERNORS:
+        _die(f"governor not allowed: {name}")
+    failed = []
+    for d in sorted(CPU_BASE.glob("cpu[0-9]*")):
+        gov_file = d / "cpufreq/scaling_governor"
+        if not gov_file.exists():
+            continue
+        try:
+            gov_file.write_text(name)
+        except Exception as e:
+            failed.append(f"{d.name}: {e}")
+    if failed:
+        _die("partial failure:\n" + "\n".join(failed), 2)
+    print(f"ok ({name})")
+    return 0
+
+
+def cmd_set_fan_manual(fan_idx: str, on: str) -> int:
+    if not fan_idx.isdigit():
+        _die("bad fan index")
+    if on not in ("0", "1"):
+        _die("on must be 0 or 1")
+    f = SMC_PATH / f"fan{fan_idx}_manual"
+    if not f.exists():
+        _die(f"not found: {f}")
+    f.write_text(on)
+    print(f"ok manual={on}")
+    return 0
+
+
+def cmd_set_fan_output(fan_idx: str, rpm: str) -> int:
+    if not fan_idx.isdigit():
+        _die("bad fan index")
+    if not rpm.isdigit():
+        _die("rpm must be an integer")
+    rpm_i = int(rpm)
+    if rpm_i < 0 or rpm_i > 8000:
+        _die("rpm out of range")
+    f = SMC_PATH / f"fan{fan_idx}_output"
+    if not f.exists():
+        _die(f"not found: {f}")
+    f.write_text(str(rpm_i))
+    print(f"ok rpm={rpm_i}")
+    return 0
+
+
+def cmd_manual_on(fan_idx: str, rpm: str) -> int:
+    """Atomic: stop mbpfan, set fan to manual, write RPM. Safer than three
+    separate pkexec calls."""
+    if not fan_idx.isdigit():
+        _die("bad fan index")
+    if not rpm.isdigit():
+        _die("rpm must be an integer")
+    rpm_i = int(rpm)
+    if rpm_i < 0 or rpm_i > 8000:
+        _die("rpm out of range")
+
+    fan_manual = SMC_PATH / f"fan{fan_idx}_manual"
+    fan_output = SMC_PATH / f"fan{fan_idx}_output"
+    if not fan_manual.exists() or not fan_output.exists():
+        _die("applesmc fan files missing")
+
+    # Stop mbpfan first (ignore errors — it may not be running)
+    subprocess.run(["systemctl", "stop", "mbpfan"], capture_output=True, text=True)
+    # Engage manual mode
+    fan_manual.write_text("1")
+    # Write RPM
+    fan_output.write_text(str(rpm_i))
+    print(f"ok manual on rpm={rpm_i}")
+    return 0
+
+
+def cmd_manual_off(fan_idx: str) -> int:
+    """Atomic: clear manual flag, restart mbpfan."""
+    if not fan_idx.isdigit():
+        _die("bad fan index")
+    fan_manual = SMC_PATH / f"fan{fan_idx}_manual"
+    if fan_manual.exists():
+        try:
+            fan_manual.write_text("0")
+        except Exception as e:
+            print(f"warning: could not clear manual flag: {e}", file=sys.stderr)
+    # Restart mbpfan so the daemon retakes control (with reset-failed safety)
+    rc, out, err = _restart_with_reset("mbpfan")
+    sys.stdout.write(out)
+    sys.stderr.write(err)
+    if rc != 0:
+        # Not fatal: manual flag is cleared, the kernel falls back to its own logic
+        print("(mbpfan restart failed, but fan returned to auto)", file=sys.stderr)
+    print("ok manual off")
+    return 0
+
+
+def cmd_drop_caches() -> int:
+    """Free up the kernel pagecache, dentries and inodes."""
+    subprocess.run(["sync"], capture_output=True, text=True)
+    try:
+        Path("/proc/sys/vm/drop_caches").write_text("3\n")
+    except Exception as e:
+        _die(f"drop_caches failed: {e}")
+    print("ok caches dropped")
+    return 0
+
+
+def cmd_cleanup(keys: list[str]) -> int:
+    """Run the requested cleanup actions. Privileged-side counterpart of
+    core.sys_actions.run_cleanup."""
+    valid = {"drop_caches", "journal", "apt",
+             "thumbnails", "user_cache", "trash"}
+    keys = [k for k in keys if k in valid]
+    if not keys:
+        _die("no valid cleanup keys")
+    # Resolve the calling user's home dir (pkexec runs as root)
+    real_home: Optional[Path] = None
+    uid = os.environ.get("PKEXEC_UID")
+    if uid:
+        try:
+            import pwd
+            real_home = Path(pwd.getpwuid(int(uid)).pw_dir)
+        except Exception:
+            real_home = None
+    if real_home is None:
+        real_home = Path.home()
+
+    errors: list[str] = []
+    for k in keys:
+        try:
+            if k == "drop_caches":
+                subprocess.run(["sync"], capture_output=True, text=True)
+                Path("/proc/sys/vm/drop_caches").write_text("3\n")
+            elif k == "journal":
+                subprocess.run(["journalctl", "--vacuum-size=100M"],
+                               capture_output=True, text=True, timeout=30)
+            elif k == "apt":
+                subprocess.run(["apt-get", "clean"],
+                               capture_output=True, text=True, timeout=30)
+            elif k == "thumbnails":
+                _rm_tree(real_home / ".cache" / "thumbnails")
+            elif k == "user_cache":
+                cache = real_home / ".cache"
+                if cache.exists():
+                    for child in cache.iterdir():
+                        if child.name == "thumbnails":
+                            continue
+                        _rm_tree(child)
+            elif k == "trash":
+                _rm_tree(real_home / ".local" / "share" / "Trash")
+        except Exception as e:
+            errors.append(f"{k}: {e}")
+    if errors:
+        _die("; ".join(errors))
+    print(f"ok cleaned {','.join(keys)}")
+    return 0
+
+
+def _rm_tree(p: Path) -> None:
+    """Delete contents of p but keep the directory itself (so apps can recreate)."""
+    if not p.exists():
+        return
+    if not p.is_dir():
+        try:
+            p.unlink()
+        except Exception:
+            pass
+        return
+    import shutil
+    for child in p.iterdir():
+        try:
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink()
+        except Exception:
+            pass
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        _die("helper must run as root (invoke via pkexec)")
+    if len(sys.argv) < 2:
+        _die("usage: macfan-helper <subcommand> [args...]")
+
+    sub = sys.argv[1]
+    args = sys.argv[2:]
+
+    handlers = {
+        "write-conf":      lambda: cmd_write_conf(),
+        "restart-mbpfan":  lambda: cmd_restart_mbpfan(),
+        "enable-mbpfan":   lambda: cmd_enable_mbpfan(),
+        "install-mbpfan":  lambda: cmd_install_mbpfan(),
+        "set-governor":    lambda: cmd_set_governor(args[0]),
+        "set-fan-manual":  lambda: cmd_set_fan_manual(args[0], args[1]),
+        "set-fan-output":  lambda: cmd_set_fan_output(args[0], args[1]),
+        "manual-on":       lambda: cmd_manual_on(args[0], args[1]),
+        "manual-off":      lambda: cmd_manual_off(args[0]),
+        "drop-caches":     lambda: cmd_drop_caches(),
+        "cleanup":         lambda: cmd_cleanup(args),
+    }
+    fn = handlers.get(sub)
+    if fn is None:
+        _die(f"unknown subcommand: {sub}")
+    try:
+        return fn()
+    except IndexError:
+        _die("missing arguments")
+    except Exception as e:
+        _die(f"error: {e}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
