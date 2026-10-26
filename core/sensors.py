@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Sensor reading layer for MacBookAir7,2 (Early 2015) on Parrot OS.
 
@@ -63,6 +64,14 @@ class ThrottleInfo:
 
 
 @dataclass
+class DmiInfo:
+    """Hardware DMI information (Laptop vendor, product name, chassis type)."""
+    vendor: str
+    product: str
+    chassis: str
+
+
+@dataclass
 class DiskInfo:
     """SMART-derived info for the primary disk (best-effort, no smartctl needed)."""
     device: str
@@ -101,6 +110,44 @@ class TopProcess:
 
 
 @dataclass
+class NetworkInfo:
+    bytes_sent_per_sec: float = 0.0
+    bytes_recv_per_sec: float = 0.0
+    interface: str = ""
+    ssid: Optional[str] = None
+    band: Optional[str] = None          # "2.4 GHz" | "5 GHz" | "6 GHz"
+    signal_percent: Optional[int] = None
+    is_connected: bool = False
+    total_sent_bytes: int = 0
+    total_recv_bytes: int = 0
+
+
+@dataclass
+class PowerAnalytics:
+    watts: Optional[float] = None
+    is_charging: bool = False
+    power_source: str = "AC"            # "AC" | "Battery"
+    energy_now_wh: Optional[float] = None
+    energy_full_wh: Optional[float] = None
+    energy_design_wh: Optional[float] = None
+    health_percent: Optional[float] = None
+    wear_percent: Optional[float] = None
+    cycle_count: Optional[int] = None
+    seconds_left: Optional[int] = None
+
+
+@dataclass
+class QuickControlsState:
+    brightness_percent: Optional[int] = None
+    brightness_supported: bool = False
+    turbo_enabled: Optional[bool] = None
+    turbo_supported: bool = False
+    volume_percent: Optional[int] = None
+    is_muted: bool = False
+    audio_supported: bool = False
+
+
+@dataclass
 class Snapshot:
     """One sample of the entire system state."""
     timestamp: float
@@ -119,6 +166,10 @@ class Snapshot:
     extra_temps: dict[str, float] = field(default_factory=dict)
     throttle: Optional[ThrottleInfo] = None
     disk: Optional[DiskInfo] = None
+    dmi: Optional[DmiInfo] = None
+    network: Optional[NetworkInfo] = None
+    power: Optional[PowerAnalytics] = None
+    quick_controls: Optional[QuickControlsState] = None
 
     def gpu_temp(self) -> Optional[float]:
         """GPU temp from any available SMC label."""
@@ -150,66 +201,219 @@ def _read_float_milli(path: Path) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
+# Hardware DMI Detection
+# ---------------------------------------------------------------------------
+
+_cached_dmi: Optional[DmiInfo] = None
+
+def read_dmi() -> DmiInfo:
+    global _cached_dmi
+    if _cached_dmi is not None:
+        return _cached_dmi
+    dmi_path = Path("/sys/class/dmi/id")
+    vendor = _read_str(dmi_path / "sys_vendor") or "Generic"
+    product = _read_str(dmi_path / "product_name") or "Linux Computer"
+    chassis_code = _read_str(dmi_path / "chassis_type") or "9"
+    # Portable / Laptop chassis codes
+    if chassis_code in ("8", "9", "10", "11", "14", "30", "31", "32"):
+        chassis = "Laptop"
+    elif chassis_code in ("3", "4", "5", "6", "7"):
+        chassis = "Desktop"
+    else:
+        chassis = "PC"
+    _cached_dmi = DmiInfo(vendor=vendor, product=product, chassis=chassis)
+    return _cached_dmi
+
+
+# ---------------------------------------------------------------------------
+# Dynamic SMC and Fan Path Detection
+# ---------------------------------------------------------------------------
+
+def find_smc_path() -> Optional[Path]:
+    """Find the Apple SMC sysfs path across different kernel builds."""
+    candidates = [
+        Path("/sys/devices/platform/applesmc.768"),
+        Path("/sys/devices/platform/applesmc"),
+    ]
+    for c in candidates:
+        if c.exists() and (c / "fan1_input").exists():
+            return c
+    try:
+        for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+            if _read_str(hw / "name") == "applesmc":
+                return hw
+    except Exception:
+        pass
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Fans
 # ---------------------------------------------------------------------------
 
 def read_fans() -> list[FanInfo]:
+    """Read fans from Apple SMC, Lenovo ThinkPad, ASUS, or generic Linux hwmon drivers."""
     fans: list[FanInfo] = []
-    if not SMC_PATH.exists():
-        return fans
-    for input_file in sorted(SMC_PATH.glob("fan*_input")):
-        # fan1_input -> index 1
-        name = input_file.name
+
+    # 1. Lenovo ThinkPad ACPI interface
+    tp_fan = Path("/proc/acpi/ibm/fan")
+    if tp_fan.exists():
         try:
-            idx = int(name.replace("fan", "").replace("_input", ""))
-        except ValueError:
-            continue
-        rpm = _read_int(input_file) or 0
-        label = _read_str(SMC_PATH / f"fan{idx}_label") or f"Fan {idx}"
-        mn = _read_int(SMC_PATH / f"fan{idx}_min") or 0
-        mx = _read_int(SMC_PATH / f"fan{idx}_max") or 6500
-        manual = bool(_read_int(SMC_PATH / f"fan{idx}_manual") or 0)
-        fans.append(FanInfo(index=idx, label=label, rpm=rpm, min_rpm=mn, max_rpm=mx, manual=manual))
+            lines = tp_fan.read_text().splitlines()
+            speed = 0
+            manual = False
+            for line in lines:
+                if line.startswith("speed:"):
+                    speed = int(line.split(":")[1].strip())
+                elif line.startswith("level:"):
+                    lvl = line.split(":")[1].strip().lower()
+                    manual = (lvl != "auto")
+            fans.append(FanInfo(
+                index=1,
+                label="ThinkPad Fan",
+                rpm=speed,
+                min_rpm=0,
+                max_rpm=5500,
+                manual=manual,
+            ))
+            return fans
+        except Exception:
+            pass
+
+    # 2. Apple SMC
+    smc = find_smc_path()
+    if smc is not None and list(smc.glob("fan*_input")):
+        for input_file in sorted(smc.glob("fan*_input")):
+            name = input_file.name
+            try:
+                idx = int(name.replace("fan", "").replace("_input", ""))
+            except ValueError:
+                continue
+            rpm = _read_int(input_file) or 0
+            label = _read_str(smc / f"fan{idx}_label") or f"Fan {idx}"
+            mn = _read_int(smc / f"fan{idx}_min") or 0
+            mx = _read_int(smc / f"fan{idx}_max") or 6500
+            manual = bool(_read_int(smc / f"fan{idx}_manual") or 0)
+            fans.append(FanInfo(index=idx, label=label, rpm=rpm, min_rpm=mn, max_rpm=mx, manual=manual))
+        if fans:
+            return fans
+
+    # 2b. Apple SMC via macsmc (/dev/smc ioctl on Linux >= 6.13 / CachyOS / Asahi)
+    try:
+        from core.macsmc import has_macsmc, query_fans
+        if has_macsmc():
+            smc_fans = query_fans()
+            if smc_fans:
+                for f in smc_fans:
+                    fans.append(FanInfo(
+                        index=f.index,
+                        label=f.label,
+                        rpm=f.rpm,
+                        min_rpm=f.min_rpm,
+                        max_rpm=f.max_rpm,
+                        manual=f.manual,
+                    ))
+                return fans
+    except Exception:
+        pass
+
+    # 3. Generic Linux hwmon (e.g. Dell, ASUS, Acer, HP, Framework, Tuxedo, Clevo)
+    try:
+        fan_count = 0
+        for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+            fan_inputs = sorted(hw.glob("fan*_input"))
+            if not fan_inputs:
+                continue
+            hw_name = _read_str(hw / "name") or "System"
+            for input_file in fan_inputs:
+                name = input_file.name
+                try:
+                    idx = int(name.replace("fan", "").replace("_input", ""))
+                except ValueError:
+                    continue
+                fan_count += 1
+                rpm = _read_int(input_file) or 0
+                raw_label = _read_str(hw / f"fan{idx}_label")
+                if raw_label:
+                    label = raw_label
+                elif fan_count == 1:
+                    label = "CPU Fan"
+                elif fan_count == 2:
+                    label = "GPU Fan"
+                else:
+                    label = f"{hw_name} Fan {idx}"
+
+                mn = _read_int(hw / f"fan{idx}_min") or 0
+                mx = _read_int(hw / f"fan{idx}_max") or max(6000, rpm)
+                manual = False
+                pwm_en = hw / f"pwm{idx}_enable"
+                if pwm_en.exists():
+                    v = _read_int(pwm_en)
+                    manual = (v == 1)
+                fans.append(FanInfo(index=idx, label=label, rpm=rpm, min_rpm=mn, max_rpm=mx, manual=manual))
+    except Exception:
+        pass
+
     return fans
 
 
 # ---------------------------------------------------------------------------
-# CPU temps (coretemp via hwmon)
+# Universal CPU temps (Intel coretemp, AMD k10temp/zenpower, ARM SoC, ACPI)
 # ---------------------------------------------------------------------------
 
-def _find_coretemp_hwmon() -> Optional[Path]:
+def _find_cpu_hwmon_devices() -> list[Path]:
+    """Find CPU temperature hwmon devices across all architectures."""
+    devices: list[Path] = []
+    known = {"coretemp", "k10temp", "zenpower", "cpu_thermal", "soc_thermal", "acpitz", "macsmc_hwmon"}
     for hw in Path("/sys/class/hwmon").glob("hwmon*"):
-        name = _read_str(hw / "name")
-        if name == "coretemp":
-            return hw
-    return None
+        name = (_read_str(hw / "name") or "").lower()
+        if name in known or "cpu" in name or "k10" in name or "thermal" in name:
+            devices.append(hw)
+    if not devices:
+        for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+            for lbl in hw.glob("temp*_label"):
+                txt = (_read_str(lbl) or "").lower()
+                if any(k in txt for k in ("core", "package", "tctl", "tdie", "cpu")):
+                    devices.append(hw)
+                    break
+    return devices
 
 
 def read_cpu_temps() -> tuple[Optional[float], Optional[float], list[float]]:
-    """Returns (max_core_temp, pkg_temp, [core_temps])."""
-    hw = _find_coretemp_hwmon()
-    if hw is None:
+    """Returns (max_core_temp, pkg_temp, [core_temps]). Universal across Intel, AMD, ARM."""
+    devices = _find_cpu_hwmon_devices()
+    if not devices:
         return None, None, []
     pkg_temp: Optional[float] = None
     core_temps: list[float] = []
-    for temp_input in sorted(hw.glob("temp*_input")):
-        idx = temp_input.name.replace("temp", "").replace("_input", "")
-        label = _read_str(hw / f"temp{idx}_label") or ""
-        val = _read_float_milli(temp_input)
-        if val is None:
-            continue
-        if "Package" in label:
-            pkg_temp = val
-        elif "Core" in label:
-            core_temps.append(val)
+    for hw in devices:
+        for temp_input in sorted(hw.glob("temp*_input")):
+            idx = temp_input.name.replace("temp", "").replace("_input", "")
+            label = _read_str(hw / f"temp{idx}_label") or ""
+            val = _read_float_milli(temp_input)
+            if val is None or not (0 < val < 135):
+                continue
+            lbl_low = label.lower()
+            if any(k in lbl_low for k in ("package", "tdie", "tctl")):
+                if pkg_temp is None or val > pkg_temp:
+                    pkg_temp = val
+            elif any(k in lbl_low for k in ("core", "tccd")):
+                core_temps.append(val)
+            elif not label:
+                core_temps.append(val)
+    if pkg_temp is None and core_temps:
+        pkg_temp = max(core_temps)
     max_core = max(core_temps) if core_temps else pkg_temp
     return max_core, pkg_temp, core_temps
 
 
 def read_smc_extra_temps() -> dict[str, float]:
-    """All SMC temps, keyed by friendly name when known and also by raw label.
-    The kernel's applesmc module may expose either the 4-char SMC key (e.g. 'TB0T')
-    or a human-readable label depending on version — we accept both."""
+    """All hardware & SMC temps, keyed by friendly name when known and also by raw label.
+    Supports legacy applesmc, modern macsmc_hwmon, and generic hwmon nodes."""
+    import re
     label_map = {
         # SMC keys
         "TCGC": "GPU Core", "TG0D": "GPU", "TG0H": "GPU Heatsink",
@@ -226,28 +430,52 @@ def read_smc_extra_temps() -> dict[str, float]:
         "CPU Die": "CPU Die", "CPU": "CPU",
     }
     out: dict[str, float] = {}
-    if not SMC_PATH.exists():
-        return out
-    # Search both the new hwmon subdir and the direct attrs (older kernels)
-    search_paths = []
-    smc_hwmon = SMC_PATH / "hwmon"
-    if smc_hwmon.exists():
-        search_paths.extend(smc_hwmon.glob("hwmon*"))
-    search_paths.append(SMC_PATH)  # fallback to direct attrs
+    search_paths: set[Path] = set()
+
+    smc = find_smc_path()
+    if smc is not None:
+        search_paths.add(smc)
+        smc_hwmon = smc / "hwmon"
+        if smc_hwmon.exists():
+            for sub in smc_hwmon.glob("hwmon*"):
+                search_paths.add(sub)
+
+    # Always scan all /sys/class/hwmon directories
+    try:
+        for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+            search_paths.add(hw)
+    except Exception:
+        pass
+
     for hw in search_paths:
         for temp_input in hw.glob("temp*_input"):
             idx = temp_input.name.replace("temp", "").replace("_input", "")
             label = _read_str(hw / f"temp{idx}_label") or ""
             val = _read_float_milli(temp_input)
-            if val is None or not (-20 < val < 130):
+            if val is None or not (-30 < val < 135):
                 continue
-            # Always store under the raw label (whatever it is)
             if label:
                 out[label] = val
-            # Also store under the friendly key when known
-            friendly = label_map.get(label)
-            if friendly:
-                out.setdefault(friendly, val)
+                # Extract 4-char SMC key from parentheses e.g. TC1C in "CPU Core 1 (TC1C)"
+                m = re.search(r"\(([A-Za-z0-9_]{4})\)", label)
+                if m:
+                    key = m.group(1)
+                    out[key] = val
+                    if key in label_map:
+                        out.setdefault(label_map[key], val)
+                friendly = label_map.get(label)
+                if friendly:
+                    out.setdefault(friendly, val)
+                # Friendly fallback heuristics
+                low = label.lower()
+                if "gpu" in low or "gfx" in low:
+                    out.setdefault("GPU", val)
+                elif "wireless" in low or "wifi" in low:
+                    out.setdefault("WiFi", val)
+                elif "heatpipe" in low:
+                    out.setdefault("Heatpipe", val)
+                elif "pch" in low:
+                    out.setdefault("PCH", val)
     return out
 
 
@@ -280,7 +508,7 @@ def read_cpu_freq() -> tuple[Optional[float], Optional[float]]:
 
 
 # ---------------------------------------------------------------------------
-# GPU (Intel HD Graphics 6000)
+# Universal GPU (Intel, AMD Radeon, NVIDIA)
 # ---------------------------------------------------------------------------
 
 _last_gpu_busy_ns: Optional[int] = None
@@ -289,8 +517,7 @@ _cached_intel_card: Optional[Path] = None
 
 
 def _find_intel_card() -> Optional[Path]:
-    """Locate the Intel iGPU sysfs directory. Cards may be card0, card1, etc.
-    on modern kernels with DRM display device split."""
+    """Locate the Intel iGPU sysfs directory. Cards may be card0, card1, etc."""
     global _cached_intel_card
     if _cached_intel_card is not None and _cached_intel_card.exists():
         return _cached_intel_card
@@ -298,14 +525,12 @@ def _find_intel_card() -> Optional[Path]:
     for card_path in sorted(DRM_PATH.glob("card*")):
         if not card_path.is_dir() or "-" in card_path.name:
             continue
-        # Need an Intel device (vendor 0x8086) with i915 driver
         vendor_file = card_path / "device" / "vendor"
         try:
             if vendor_file.exists() and vendor_file.read_text().strip() == "0x8086":
                 candidates.append(card_path)
         except Exception:
             continue
-    # Prefer one that has gt_cur_freq_mhz (the render device, not display-only)
     for c in candidates:
         if (c / "gt_cur_freq_mhz").exists():
             _cached_intel_card = c
@@ -318,93 +543,150 @@ def _find_intel_card() -> Optional[Path]:
 
 def read_gpu() -> GpuInfo:
     global _last_gpu_busy_ns, _last_gpu_busy_time
+
+    # 1. Intel GPU
     card = _find_intel_card()
-    if card is None:
-        return GpuInfo(cur_freq_mhz=None, max_freq_mhz=None, busy_percent=None)
-    cur = _read_int(card / "gt_cur_freq_mhz")
-    mx = _read_int(card / "gt_max_freq_mhz")
+    if card is not None:
+        cur = _read_int(card / "gt_cur_freq_mhz")
+        mx = _read_int(card / "gt_max_freq_mhz")
+        busy_pct: Optional[float] = None
+        busy_files = list(card.glob("engine/*/busy"))
+        if busy_files:
+            total_ns = 0
+            any_read = False
+            for bf in busy_files:
+                v = _read_int(bf)
+                if v is not None:
+                    total_ns += v
+                    any_read = True
+            if any_read:
+                now = time.monotonic()
+                if _last_gpu_busy_ns is not None and _last_gpu_busy_time is not None:
+                    dt_ns = (now - _last_gpu_busy_time) * 1e9
+                    db = total_ns - _last_gpu_busy_ns
+                    if dt_ns > 0 and db >= 0:
+                        busy_pct = min(100.0, max(0.0, db / dt_ns * 100.0 / max(1, len(busy_files))))
+                _last_gpu_busy_ns = total_ns
+                _last_gpu_busy_time = now
+        return GpuInfo(cur_freq_mhz=cur, max_freq_mhz=mx, busy_percent=busy_pct)
 
-    busy_pct: Optional[float] = None
-    # Method 1: per-engine busy counters (i915, kernel >= 5.13)
-    busy_files = list(card.glob("engine/*/busy"))
-    if busy_files:
-        total_ns = 0
-        any_read = False
-        for bf in busy_files:
-            v = _read_int(bf)
-            if v is not None:
-                total_ns += v
-                any_read = True
-        if any_read:
-            now = time.monotonic()
-            if _last_gpu_busy_ns is not None and _last_gpu_busy_time is not None:
-                dt_ns = (now - _last_gpu_busy_time) * 1e9
-                db = total_ns - _last_gpu_busy_ns
-                if dt_ns > 0 and db >= 0:
-                    # Average across engines (cap at 100% per-engine sum)
-                    busy_pct = min(100.0, max(0.0, db / dt_ns * 100.0 / max(1, len(busy_files))))
-            _last_gpu_busy_ns = total_ns
-            _last_gpu_busy_time = now
+    # 2. AMD Radeon (amdgpu driver)
+    try:
+        for card_path in sorted(DRM_PATH.glob("card*")):
+            dev = card_path / "device"
+            busy_file = dev / "gpu_busy_percent"
+            if busy_file.exists():
+                busy = _read_int(busy_file)
+                cur_f = None
+                for hw in (dev / "hwmon").glob("hwmon*") if (dev / "hwmon").exists() else []:
+                    f = _read_int(hw / "freq1_input")
+                    if f: cur_f = int(f / 1_000_000)
+                return GpuInfo(cur_freq_mhz=cur_f, max_freq_mhz=None, busy_percent=float(busy) if busy is not None else None)
+    except Exception:
+        pass
 
-    return GpuInfo(cur_freq_mhz=cur, max_freq_mhz=mx, busy_percent=busy_pct)
+    # 3. NVIDIA GPU (nvidia-smi)
+    if shutil.which("nvidia-smi"):
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=utilization.gpu,clocks.current.graphics,clocks.max.graphics",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=1,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                parts = [p.strip() for p in r.stdout.strip().split(",")]
+                util = float(parts[0]) if len(parts) > 0 and parts[0].replace(".", "", 1).isdigit() else None
+                cur_c = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                max_c = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+                return GpuInfo(cur_freq_mhz=cur_c, max_freq_mhz=max_c, busy_percent=util)
+        except Exception:
+            pass
+
+    return GpuInfo(cur_freq_mhz=None, max_freq_mhz=None, busy_percent=None)
 
 
 # ---------------------------------------------------------------------------
-# Battery
+# Universal Battery (BAT0, BAT1, BATT, any power supply)
 # ---------------------------------------------------------------------------
+
+def find_battery_path() -> Optional[Path]:
+    """Dynamically locate battery across all laptop brands."""
+    base = Path("/sys/class/power_supply")
+    for p in sorted(base.glob("BAT*")):
+        if (p / "voltage_now").exists() or (p / "capacity").exists() or (p / "energy_now").exists() or (p / "charge_now").exists():
+            return p
+    for p in base.glob("*"):
+        try:
+            if _read_str(p / "type") == "Battery":
+                return p
+        except Exception:
+            pass
+    return None
+
 
 def read_battery() -> Optional[BatteryInfo]:
-    if not BATTERY_PATH.exists():
-        return None
+    bat_path = find_battery_path()
     try:
         bat = psutil.sensors_battery()
-        if bat is None:
-            return None
-        seconds = None
-        if bat.secsleft is not None and bat.secsleft >= 0:
-            seconds = int(bat.secsleft)
+    except Exception:
+        bat = None
 
-        # Extra info from sysfs directly
-        voltage = _read_float_milli(BATTERY_PATH / "voltage_now")
-        if voltage is not None:
-            voltage = voltage / 1000.0  # microvolt -> volt
-        current = _read_float_milli(BATTERY_PATH / "current_now")
-        if current is not None:
-            current = current / 1000.0  # microamp -> amp
+    if bat is None and bat_path is None:
+        return None
 
-        # Battery temp: try multiple sources
-        temp_c: Optional[float] = None
-        # 1) /sys/class/power_supply/BAT0/temp (tenths of °C on most kernels)
-        psup_temp = _read_int(BATTERY_PATH / "temp")
-        if psup_temp is not None:
-            # Could be tenths of °C (typical) or millidegrees on some kernels
-            if 100 < psup_temp < 1000:
-                temp_c = psup_temp / 10.0
-            elif 10000 < psup_temp < 100000:
-                temp_c = psup_temp / 1000.0
-        # 2) Fall back to SMC (TB0T or "Battery" label)
+    try:
+        pct = bat.percent if bat else None
+        plugged = bat.power_plugged if bat else False
+        seconds = int(bat.secsleft) if (bat and bat.secsleft is not None and bat.secsleft >= 0) else None
+
+        voltage = None
+        current = None
+        temp_c = None
+        cycle = None
+        energy_full_wh = None
+        energy_full_design_wh = None
+        health = None
+
+        if bat_path is not None:
+            if pct is None:
+                cap = _read_int(bat_path / "capacity")
+                if cap is not None: pct = float(cap)
+
+            # Voltage
+            v = _read_float_milli(bat_path / "voltage_now")
+            if v is not None: voltage = v / 1000.0
+
+            # Current or Power
+            c = _read_float_milli(bat_path / "current_now")
+            if c is not None: current = c / 1000.0
+
+            # Battery temp
+            psup_temp = _read_int(bat_path / "temp")
+            if psup_temp is not None:
+                if 100 < psup_temp < 1000:
+                    temp_c = psup_temp / 10.0
+                elif 10000 < psup_temp < 100000:
+                    temp_c = psup_temp / 1000.0
+
+            # Health & cycles
+            cycle = _read_int(bat_path / "cycle_count")
+            ef = _read_int(bat_path / "energy_full") or _read_int(bat_path / "charge_full")
+            efd = _read_int(bat_path / "energy_full_design") or _read_int(bat_path / "charge_full_design")
+            if ef: energy_full_wh = ef / 1_000_000.0
+            if efd: energy_full_design_wh = efd / 1_000_000.0
+            if ef and efd and efd > 0:
+                health = min(100.0, ef / efd * 100.0)
+
         if temp_c is None:
             extras = read_smc_extra_temps()
             temp_c = _get_temp(extras, "Battery", "TB0T")
 
-        # Battery health & cycle count
-        cycle = _read_int(BATTERY_PATH / "cycle_count")
-        ef = _read_int(BATTERY_PATH / "energy_full")
-        efd = _read_int(BATTERY_PATH / "energy_full_design")
-        # Some kernels use charge_full instead of energy_full (units differ but ratio still valid)
-        if ef is None:
-            ef = _read_int(BATTERY_PATH / "charge_full")
-        if efd is None:
-            efd = _read_int(BATTERY_PATH / "charge_full_design")
-        energy_full_wh = ef / 1_000_000.0 if ef else None
-        energy_full_design_wh = efd / 1_000_000.0 if efd else None
-        health = None
-        if ef and efd and efd > 0:
-            health = min(100.0, ef / efd * 100.0)
+        if pct is None:
+            return None
 
         return BatteryInfo(
-            percent=bat.percent,
-            plugged=bat.power_plugged,
+            percent=pct,
+            plugged=plugged,
             seconds_left=seconds,
             temp_c=temp_c,
             voltage_v=voltage,
@@ -540,7 +822,6 @@ def read_throttle() -> ThrottleInfo:
 def _detect_primary_disk() -> Optional[str]:
     """Find the device for /. Returns something like 'sda' or 'nvme0n1'."""
     try:
-        # findmnt is in util-linux on Parrot
         r = subprocess.run(
             ["findmnt", "-no", "SOURCE", "/"],
             capture_output=True, text=True, timeout=2,
@@ -548,15 +829,16 @@ def _detect_primary_disk() -> Optional[str]:
         src = r.stdout.strip()
         if not src:
             return None
-        # Strip /dev/ and any partition number to get the parent device
+        # Clean Btrfs/ZFS subvolume tags like /dev/sda2[/@] -> /dev/sda2
+        if "[" in src:
+            src = src.split("[")[0]
+        # Strip /dev/
         name = src.replace("/dev/", "")
-        # Handle nvme0n1p3 -> nvme0n1, sda3 -> sda
-        if name.startswith("nvme"):
-            # nvme0n1p2 -> nvme0n1
-            import re as _re
-            m = _re.match(r"(nvme\d+n\d+)", name)
-            return m.group(1) if m else name
-        # sda1 -> sda
+        # Handle nvme, mmcblk, standard sdX/vdX/hdX
+        import re as _re
+        m = _re.match(r"^(nvme\d+n\d+|mmcblk\d+|[a-z]+)", name)
+        if m:
+            return m.group(1)
         return name.rstrip("0123456789")
     except Exception:
         return None
@@ -624,6 +906,25 @@ def read_disk() -> Optional[DiskInfo]:
                 if t is not None:
                     temp_c = t
                     break
+            elif "drivetemp" in name.lower():
+                t = _read_float_milli(hw / "temp1_input")
+                if t is not None:
+                    temp_c = t
+                    break
+
+    # Fallback: Apple SMC drive sensors (TH0A, TH0B, TH0C, etc.)
+    if temp_c is None:
+        try:
+            extra = read_smc_extra_temps()
+            for key in ("TH0A", "TH0a", "TH0B", "TH0b", "TH0C", "TH0c", "Drive 0"):
+                for ek, ev in extra.items():
+                    if key in ek and ev > 0:
+                        temp_c = float(ev)
+                        break
+                if temp_c is not None:
+                    break
+        except Exception:
+            pass
     return DiskInfo(
         device=f"/dev/{dev}",
         model=model,
@@ -645,6 +946,257 @@ def format_bytes(n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Network, Power Analytics, and Quick Controls
+# ---------------------------------------------------------------------------
+
+_last_net_bytes: Optional[tuple[float, int, int]] = None  # (time, recv, sent)
+_cached_wifi: tuple[float, Optional[str], Optional[str], Optional[int]] = (-10.0, None, None, None)
+
+
+def _read_wifi_details() -> tuple[Optional[str], Optional[str], Optional[int]]:
+    """Query Wi-Fi SSID, frequency band ('2.4 GHz' / '5 GHz' / '6 GHz'), and signal %."""
+    ssid: Optional[str] = None
+    band: Optional[str] = None
+    signal: Optional[int] = None
+
+    # Check via nmcli if present
+    if shutil.which("nmcli"):
+        try:
+            r = subprocess.run(
+                ["nmcli", "-t", "-f", "active,ssid,signal,freq", "dev", "wifi"],
+                capture_output=True, text=True, timeout=1.5
+            )
+            for line in r.stdout.splitlines():
+                parts = line.strip().split(":")
+                if len(parts) >= 4 and parts[0].lower() in ("yes", "sì", "si", "true", "ja", "oui", "1"):
+                    ssid = parts[1].strip() or None
+                    try:
+                        signal = int(parts[2].strip())
+                    except Exception:
+                        pass
+                    try:
+                        freq_val = int(parts[3].replace("MHz", "").strip())
+                        if freq_val >= 5900:
+                            band = "6 GHz"
+                        elif freq_val >= 4900:
+                            band = "5 GHz"
+                        else:
+                            band = "2.4 GHz"
+                    except Exception:
+                        pass
+                    if ssid:
+                        return ssid, band, signal
+        except Exception:
+            pass
+
+    # Fallback to iw
+    if shutil.which("iw"):
+        try:
+            r = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=1.0)
+            cur_iface = None
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("Interface "):
+                    cur_iface = line.split()[1]
+                elif line.startswith("ssid ") and cur_iface:
+                    ssid = line[5:].strip()
+            if cur_iface:
+                r_link = subprocess.run(["iw", "dev", cur_iface, "link"], capture_output=True, text=True, timeout=1.0)
+                for l in r_link.stdout.splitlines():
+                    l = l.strip()
+                    if l.startswith("SSID: ") and not ssid:
+                        ssid = l[6:].strip()
+                    elif l.startswith("freq: "):
+                        try:
+                            fval = float(l[6:].strip())
+                            if fval >= 5900:
+                                band = "6 GHz"
+                            elif fval >= 4900:
+                                band = "5 GHz"
+                            else:
+                                band = "2.4 GHz"
+                        except Exception:
+                            pass
+                    elif l.startswith("signal: "):
+                        try:
+                            dbm = float(l.split()[1])
+                            signal = int(max(0, min(100, 2 * (dbm + 100))))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    return ssid, band, signal
+
+
+def read_network() -> NetworkInfo:
+    """Read network bandwidth throughput and connection info."""
+    global _last_net_bytes, _cached_wifi
+    now = time.time()
+    try:
+        net = psutil.net_io_counters()
+        recv_total = net.bytes_recv
+        sent_total = net.bytes_sent
+    except Exception:
+        return NetworkInfo()
+
+    down_rate = 0.0
+    up_rate = 0.0
+    if _last_net_bytes is not None:
+        dt = max(0.1, now - _last_net_bytes[0])
+        down_rate = max(0.0, (recv_total - _last_net_bytes[1]) / dt)
+        up_rate = max(0.0, (sent_total - _last_net_bytes[2]) / dt)
+    _last_net_bytes = (now, recv_total, sent_total)
+
+    ssid, band, signal = _cached_wifi[1], _cached_wifi[2], _cached_wifi[3]
+    if (now - _cached_wifi[0]) > 4.0:
+        ssid, band, signal = _read_wifi_details()
+        _cached_wifi = (now, ssid, band, signal)
+
+    iface = ""
+    try:
+        stats = psutil.net_if_stats()
+        for name, s in stats.items():
+            if s.isup and not name.startswith(("lo", "docker", "veth", "virbr")):
+                iface = name
+                break
+    except Exception:
+        pass
+
+    return NetworkInfo(
+        bytes_sent_per_sec=up_rate,
+        bytes_recv_per_sec=down_rate,
+        interface=iface,
+        ssid=ssid,
+        band=band,
+        signal_percent=signal,
+        is_connected=bool(iface),
+        total_sent_bytes=sent_total,
+        total_recv_bytes=recv_total,
+    )
+
+
+def read_power_analytics(battery: Optional[BatteryInfo],
+                         cpu_freq_mhz: Optional[float] = None,
+                         cpu_freq_max_mhz: Optional[float] = None,
+                         cpu_percent: float = 0.0) -> PowerAnalytics:
+    """Read real-time power draw (Watts), wear level, and charging state."""
+    watts: Optional[float] = None
+    is_charging = False
+    source = "AC"
+    energy_now_wh = None
+    energy_full_wh = None
+    energy_design_wh = None
+    health_percent = None
+    wear_percent = None
+    cycle_count = None
+    seconds_left = None
+
+    if battery is not None:
+        is_charging = battery.plugged and (battery.seconds_left is None and battery.percent < 99.0)
+        source = "AC" if battery.plugged else "Battery"
+        energy_full_wh = battery.energy_full_wh
+        energy_design_wh = battery.energy_full_design_wh
+        health_percent = battery.health_percent
+        if health_percent is not None:
+            wear_percent = max(0.0, min(100.0, 100.0 - health_percent))
+        cycle_count = battery.cycle_count
+        seconds_left = battery.seconds_left
+
+        if battery.voltage_v is not None and battery.current_a is not None and battery.current_a > 0:
+            watts = round(battery.voltage_v * battery.current_a, 1)
+
+    if watts is None:
+        for ps in Path("/sys/class/power_supply").glob("BAT*"):
+            p_now = ps / "power_now"
+            if p_now.exists():
+                val = _read_int(p_now)
+                if val and val > 0:
+                    watts = round(val / 1e6, 1)
+                    break
+
+    if watts is None:
+        freq_ratio = (cpu_freq_mhz / (cpu_freq_max_mhz or 2500.0)) if cpu_freq_mhz else 0.5
+        load_ratio = cpu_percent / 100.0
+        base_w = 4.0
+        dyn_w = 11.0 * freq_ratio * (0.3 + 0.7 * load_ratio)
+        watts = round(base_w + dyn_w, 1)
+
+    return PowerAnalytics(
+        watts=watts,
+        is_charging=is_charging,
+        power_source=source,
+        energy_now_wh=energy_now_wh,
+        energy_full_wh=energy_full_wh,
+        energy_design_wh=energy_design_wh,
+        health_percent=health_percent,
+        wear_percent=wear_percent,
+        cycle_count=cycle_count,
+        seconds_left=seconds_left,
+    )
+
+
+def read_quick_controls() -> QuickControlsState:
+    """Read screen brightness, turbo boost state, and audio volume."""
+    b_pct: Optional[int] = None
+    b_supported = False
+    for b in Path("/sys/class/backlight").glob("*"):
+        b_cur = b / "brightness"
+        b_max = b / "max_brightness"
+        if b_cur.exists() and b_max.exists():
+            cur_v = _read_int(b_cur)
+            max_v = _read_int(b_max)
+            if cur_v is not None and max_v is not None and max_v > 0:
+                b_pct = int(round(cur_v / max_v * 100.0))
+                b_supported = True
+                break
+
+    turbo_enabled: Optional[bool] = None
+    turbo_supported = False
+    pstate_no_turbo = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
+    cpufreq_boost = Path("/sys/devices/system/cpu/cpufreq/boost")
+    if pstate_no_turbo.exists():
+        turbo_supported = True
+        v = _read_str(pstate_no_turbo)
+        turbo_enabled = (v == "0")
+    elif cpufreq_boost.exists():
+        turbo_supported = True
+        v = _read_str(cpufreq_boost)
+        turbo_enabled = (v == "1")
+
+    vol_pct: Optional[int] = None
+    is_muted = False
+    audio_supported = False
+    if shutil.which("wpctl"):
+        try:
+            r = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                               capture_output=True, text=True, timeout=0.5)
+            if r.returncode == 0:
+                line = r.stdout.strip()
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        vol_f = float(parts[1])
+                        vol_pct = int(round(vol_f * 100.0))
+                        is_muted = "[MUTED]" in line
+                        audio_supported = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return QuickControlsState(
+        brightness_percent=b_pct,
+        brightness_supported=b_supported,
+        turbo_enabled=turbo_enabled,
+        turbo_supported=turbo_supported,
+        volume_percent=vol_pct,
+        is_muted=is_muted,
+        audio_supported=audio_supported,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level snapshot
 # ---------------------------------------------------------------------------
 
@@ -657,6 +1209,7 @@ def snapshot(include_top_processes: bool = True,
     max_t, pkg_t, cores = read_cpu_temps()
     load_total, load_per = read_cpu_load()
     f_cur, f_max = read_cpu_freq()
+    bat = read_battery()
     return Snapshot(
         timestamp=time.time(),
         cpu_temp_c=max_t,
@@ -668,12 +1221,16 @@ def snapshot(include_top_processes: bool = True,
         cpu_freq_max_mhz=f_max,
         fans=read_fans(),
         gpu=read_gpu(),
-        battery=read_battery(),
+        battery=bat,
         memory=read_memory(),
         top_processes=read_top_processes(top_processes_limit) if include_top_processes else [],
         extra_temps=read_smc_extra_temps(),
         throttle=read_throttle(),
         disk=read_disk() if include_disk else None,
+        dmi=read_dmi(),
+        network=read_network(),
+        power=read_power_analytics(bat, f_cur, f_max, load_total),
+        quick_controls=read_quick_controls(),
     )
 
 

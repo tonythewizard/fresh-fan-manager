@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 FitLabel — a QLabel that shrinks its font size so the text always fits
 the available width. Used for the big GPU/Battery numbers that would

@@ -1,23 +1,23 @@
 ---
 name: Feature request
-about: Suggerisci una nuova funzionalità
+about: Suggest an improvement or new feature
 title: '[FEATURE] '
 labels: enhancement
 assignees: ''
 ---
 
-## Il problema che vuoi risolvere
+## Problem or use case
 
-<!-- Descrizione chiara del problema o caso d'uso. Es. "Mi piacerebbe poter..." -->
+Describe what you are trying to achieve.
 
-## Soluzione che proponi
+## Proposed solution
 
-<!-- Descrivi come immagini che dovrebbe funzionare -->
+Explain how you would expect the feature to work.
 
-## Alternative considerate
+## Alternatives considered
 
-<!-- Hai pensato ad altre soluzioni? -->
+Describe other approaches you have considered.
 
-## Contesto aggiuntivo
+## Additional context
 
-<!-- Screenshot, mockup, link a tool che fanno una cosa simile, etc. -->
+Include relevant hardware details, screenshots, mockups or references.

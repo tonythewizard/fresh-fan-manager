@@ -7,8 +7,8 @@
   <vendor_url>https://github.com/local/fresh-fan-manager</vendor_url>
 
   <action id="org.freshfan.manager.helper">
-    <description>Manage mbpfan and fan/governor controls</description>
-    <message>Autenticati per modificare le impostazioni della ventola</message>
+    <description>Manage fan, cooling, and governor controls</description>
+    <message>Authenticate to modify fan and cooling settings</message>
     <icon_name>system-run</icon_name>
     <defaults>
       <allow_any>auth_admin_keep</allow_any>
@@ -16,6 +16,19 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/macfan-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="org.freshfan.manager.universal.helper">
+    <description>Manage universal fan, cooling, and governor controls</description>
+    <message>Authenticate to modify fan and cooling settings</message>
+    <icon_name>system-run</icon_name>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/freshfan-helper</annotate>
     <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
   </action>
 </policyconfig>

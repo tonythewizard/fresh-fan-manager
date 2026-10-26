@@ -1,23 +1,36 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """System-level actions that may require privileges via the helper."""
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-HELPER_BIN = "/usr/local/bin/macfan-helper"
+from core.i18n import tr
+
+
+def find_helper_bin() -> str:
+    for p in ("/usr/local/bin/freshfan-helper", "/usr/local/bin/macfan-helper", "/usr/bin/freshfan-helper"):
+        if Path(p).exists():
+            return p
+    return "/usr/local/bin/freshfan-helper"
+
+
+HELPER_BIN = find_helper_bin()
 
 
 def drop_caches() -> tuple[bool, str]:
     """Drop pagecache + dentries + inodes (Linux drop_caches=3)."""
-    if not Path(HELPER_BIN).exists():
+    helper = find_helper_bin()
+    if not Path(helper).exists():
         return False, "Helper non installato"
     try:
         r = subprocess.run(
-            ["pkexec", HELPER_BIN, "drop-caches"],
+            ["pkexec", helper, "drop-caches"],
             capture_output=True, text=True, timeout=15,
         )
         return r.returncode == 0, (r.stdout + r.stderr).strip()
@@ -71,8 +84,17 @@ def _journal_size() -> int:
         return 0
 
 
-def _apt_cache_size() -> int:
-    return _du_path(Path("/var/cache/apt/archives"))
+def _pkg_cache_info() -> tuple[int, str, str]:
+    if shutil.which("pacman"):
+        p = Path("/var/cache/pacman/pkg")
+        return _du_path(p), "Pacman Cache", f"{p} — pacman downloaded package archives."
+    elif shutil.which("apt-get"):
+        p = Path("/var/cache/apt/archives")
+        return _du_path(p), "APT Cache", f"{p} — downloaded .deb package archives."
+    elif shutil.which("dnf"):
+        p = Path("/var/cache/dnf")
+        return _du_path(p), "DNF Cache", f"{p} — dnf package cache."
+    return 0, tr("target_pkg_cache"), tr("desc_pkg_cache")
 
 
 def _thumbnail_cache_size() -> int:
@@ -91,50 +113,140 @@ def _user_cache_size() -> int:
 
 
 def enumerate_cleanup_targets() -> list[CleanupTarget]:
+    pkg_size, pkg_label, pkg_desc = _pkg_cache_info()
     return [
-        CleanupTarget("drop_caches", "Cache kernel (drop_caches)",
-                      "Buffer/cache kernel — equivalente al bottone 'Libera RAM'.",
+        CleanupTarget("drop_caches", tr("target_drop_caches"),
+                      tr("desc_drop_caches"),
                       0, True),
-        CleanupTarget("journal", "Log di systemd (journalctl)",
-                      "Mantiene solo gli ultimi 100 MB di log di sistema.",
+        CleanupTarget("journal", tr("target_journal"),
+                      tr("desc_journal"),
                       _journal_size(), True),
-        CleanupTarget("apt", "Cache pacchetti apt",
-                      "/var/cache/apt/archives — file .deb scaricati.",
-                      _apt_cache_size(), True),
-        CleanupTarget("thumbnails", "Thumbnail",
-                      "~/.cache/thumbnails — miniature dei file manager.",
+        CleanupTarget("pkg_cache", pkg_label,
+                      pkg_desc,
+                      pkg_size, True),
+        CleanupTarget("thumbnails", tr("target_thumbnails"),
+                      tr("desc_thumbnails"),
                       _thumbnail_cache_size(), False),
-        CleanupTarget("user_cache", "Cache utente (~/.cache)",
-                      "Cache applicazioni utente (escluse thumbnail).",
+        CleanupTarget("user_cache", tr("target_user_cache"),
+                      tr("desc_user_cache"),
                       _user_cache_size(), False),
-        CleanupTarget("trash", "Cestino",
-                      "~/.local/share/Trash — file nel cestino.",
+        CleanupTarget("trash", tr("target_trash"),
+                      tr("desc_trash"),
                       _trash_size(), False),
     ]
 
 
+def _clean_user_directory(directory: Path, exclude: tuple[str, ...] = ()) -> None:
+    # Run with the desktop user's privileges; never ask a root helper to walk
+    # a user-controlled directory or follow its symlinks.
+    if directory.is_symlink():
+        raise ValueError(f"Refusing symlink cleanup root: {directory}")
+    if not directory.exists():
+        return
+    for child in directory.iterdir():
+        if child.name in exclude:
+            continue
+        if child.is_symlink() or not child.is_dir():
+            child.unlink()
+        else:
+            shutil.rmtree(child)
+
+
 def run_cleanup(keys: list[str]) -> tuple[bool, str, int]:
-    if not keys:
-        return False, "Nessuna voce selezionata", 0
-    if not Path(HELPER_BIN).exists():
-        return False, "Helper non installato", 0
-    before = {}
-    if "journal" in keys: before["journal"] = _journal_size()
-    if "apt" in keys: before["apt"] = _apt_cache_size()
-    if "thumbnails" in keys: before["thumbnails"] = _thumbnail_cache_size()
-    if "user_cache" in keys: before["user_cache"] = _user_cache_size()
-    if "trash" in keys: before["trash"] = _trash_size()
+    system_keys = {"drop_caches", "journal", "pkg_cache", "apt"}
+    user_keys = {"thumbnails", "user_cache", "trash"}
+    if not keys or any(key not in system_keys | user_keys for key in keys):
+        return False, "Invalid cleanup target", 0
+    targets = {t.key: t for t in enumerate_cleanup_targets()}
+    selected = set(keys)
+    if "apt" in selected:
+        selected.remove("apt")
+        selected.add("pkg_cache")
+    before = sum(targets[k].size_bytes for k in selected)
     try:
-        args = ["pkexec", HELPER_BIN, "cleanup"] + keys
-        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
-        if r.returncode != 0:
-            return False, (r.stdout + r.stderr).strip(), 0
+        privileged = sorted(selected & system_keys)
+        if privileged:
+            helper = find_helper_bin()
+            if not Path(helper).exists():
+                return False, "Helper not installed", 0
+            result = subprocess.run(["pkexec", helper, "cleanup"] + privileged,
+                                    capture_output=True, text=True, timeout=60)
+            if result.returncode != 0:
+                return False, (result.stdout + result.stderr).strip(), 0
+        home = Path.home()
+        if "thumbnails" in selected:
+            _clean_user_directory(home / ".cache/thumbnails")
+        if "user_cache" in selected:
+            _clean_user_directory(home / ".cache", exclude=("thumbnails", "fresh-fan-manager"))
+        if "trash" in selected:
+            _clean_user_directory(home / ".local/share/Trash")
+        after = {t.key: t for t in enumerate_cleanup_targets()}
+        freed = max(0, before - sum(after[k].size_bytes for k in selected))
+        return True, "ok", freed
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        return False, str(exc), 0
+
+
+def set_turbo(on: bool) -> tuple[bool, str]:
+    helper = find_helper_bin()
+    if not Path(helper).exists():
+        return False, "Helper not found"
+    try:
+        r = subprocess.run(["pkexec", helper, "set-turbo", "1" if on else "0"],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
     except Exception as e:
-        return False, str(e), 0
-    freed = 0
-    if "journal" in keys: freed += max(0, before["journal"] - _journal_size())
-    if "apt" in keys: freed += max(0, before["apt"] - _apt_cache_size())
-    if "thumbnails" in keys: freed += max(0, before["thumbnails"] - _thumbnail_cache_size())
-    if "user_cache" in keys: freed += max(0, before["user_cache"] - _user_cache_size())
-    if "trash" in keys: freed += max(0, before["trash"] - _trash_size())
-    return True, "ok", freed
+        return False, str(e)
+
+
+def set_brightness(percent: int) -> tuple[bool, str]:
+    helper = find_helper_bin()
+    if not Path(helper).exists():
+        return False, "Helper not found"
+    try:
+        pct = max(1, min(100, int(percent)))
+        r = subprocess.run(["pkexec", helper, "set-brightness", str(pct)],
+                           capture_output=True, text=True, timeout=10)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return False, str(e)
+
+
+def set_audio_volume(percent: int) -> tuple[bool, str]:
+    """Set master audio volume unprivileged via wpctl or pactl."""
+    pct = max(0, min(150, int(percent)))
+    if shutil.which("wpctl"):
+        try:
+            val_f = f"{pct / 100.0:.2f}"
+            r = subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", val_f],
+                               capture_output=True, text=True, timeout=3)
+            return r.returncode == 0, r.stdout.strip()
+        except Exception as e:
+            return False, str(e)
+    elif shutil.which("pactl"):
+        try:
+            r = subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"],
+                               capture_output=True, text=True, timeout=3)
+            return r.returncode == 0, r.stdout.strip()
+        except Exception as e:
+            return False, str(e)
+    return False, "No audio controller found"
+
+
+def toggle_audio_mute() -> tuple[bool, str]:
+    """Toggle audio mute unprivileged via wpctl or pactl."""
+    if shutil.which("wpctl"):
+        try:
+            r = subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"],
+                               capture_output=True, text=True, timeout=3)
+            return r.returncode == 0, r.stdout.strip()
+        except Exception as e:
+            return False, str(e)
+    elif shutil.which("pactl"):
+        try:
+            r = subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"],
+                               capture_output=True, text=True, timeout=3)
+            return r.returncode == 0, r.stdout.strip()
+        except Exception as e:
+            return False, str(e)
+    return False, "No audio controller found"

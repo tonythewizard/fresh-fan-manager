@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Top processes popup dialog: shows live top-N processes by CPU."""
 from __future__ import annotations
 

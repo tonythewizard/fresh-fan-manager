@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Fresh Fan Manager — Linux fan and temperature control utility
 # Copyright (C) 2025  Antonio Gullotta
 #
@@ -32,6 +33,31 @@ from pathlib import Path
 # Make local imports work when launched from any cwd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+APP_NAME = "Fresh Fan Manager"
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=APP_NAME)
+    from core.version import __version__
+    ap.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
+    ap.add_argument("--mini", action="store_true", help="Start in the compact floating window")
+    ap.add_argument("--settings", action="store_true", help="Open preferences at startup")
+    ap.add_argument("--widget", action="store_true",
+                    help="Start pinned to the desktop as a widget (xcb only)")
+    ap.add_argument("--tray", action="store_true",
+                    help="Start hidden, only tray icon visible")
+    ap.add_argument("--daemon", action="store_true",
+                    help="Run headless background daemon (no GUI required)")
+    return ap.parse_args()
+
+
+# Parse CLI arguments early (handles --help, -h, and --daemon before any Qt imports)
+_cli_args = parse_args()
+
+if _cli_args.daemon:
+    from core.daemon import HeadlessFanDaemon
+    sys.exit(HeadlessFanDaemon().run())
+
 # Read display server preference WITHOUT touching PySide6 yet, so we can set
 # the QPA platform before Qt initializes.
 from core.config import read_display_server_pref
@@ -43,9 +69,18 @@ else:
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.plugin=false")
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
+try:
+    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
+except ImportError:
+    sys.stderr.write(
+        "Error: PySide6 is required for the graphical interface.\n"
+        "Please run via the installed wrapper: fresh-fan-manager\n"
+        "Or use: /opt/fresh-fan-manager/.venv/bin/python fresh_fan_manager.py\n"
+        "For headless background control, use: fresh-fan-manager --daemon\n"
+    )
+    sys.exit(1)
 
 # Honour fractional display scaling (KDE often uses 125%/150%). Default Qt
 # rounding policy upscales at integer and then downsamples, producing jagged
@@ -66,6 +101,7 @@ except Exception:
 
 from core import config, sensors, mbpfan_ctrl
 from core.logger import get_logger
+from core.i18n import tr
 from ui.styles import build_qss
 from ui.main_window import MainWindow, APP_NAME
 from ui.tray import TrayController
@@ -74,17 +110,14 @@ from ui.log_dialog import LogDialog
 from ui.icons import app_icon
 
 
-def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description=APP_NAME)
-    ap.add_argument("--widget", action="store_true",
-                    help="Start pinned to the desktop as a widget (xcb only)")
-    ap.add_argument("--tray", action="store_true",
-                    help="Start hidden, only tray icon visible")
-    return ap.parse_args()
-
-
 def main() -> int:
-    args = parse_args()
+    args = _cli_args
+    from core.runtime import ControlLease
+    lease = ControlLease()
+    if not lease.acquire():
+        sys.stderr.write("Fresh Fan Manager GUI or daemon is already running.\n")
+        return 1
+
     log = get_logger()
     log.info(f"{APP_NAME} starting (display={_display_pref})")
 
@@ -109,6 +142,8 @@ def main() -> int:
                              f"{APP_NAME} continua comunque, ma 'chiudi' uscirà davvero.")
 
     settings = config.load()
+    if args.mini:
+        settings.mini_mode = True
     app.setStyleSheet(build_qss(settings.theme, settings.fx_level, settings.bg_effect))
 
     # If user selected Wayland but is requesting --widget, downgrade and warn
@@ -118,7 +153,7 @@ def main() -> int:
     start_widget = (args.widget or settings.widget_pinned) and _display_pref == "xcb"
 
     win = MainWindow(settings, start_in_widget_mode=start_widget)
-    tray = TrayController()
+    tray = TrayController(show_temp_number=getattr(settings, "tray_show_temp", True))
 
     # Keep app icon live in sync with temperature so the taskbar icon shifts
     # color the same way as the tray icon
@@ -127,6 +162,8 @@ def main() -> int:
             new_icon = app_icon(temp)
             app.setWindowIcon(new_icon)
             win.setWindowIcon(new_icon)
+            tray.update_state(temp, manual_mode=win.is_manual_mode(),
+                              show_temp_number=getattr(settings, "tray_show_temp", True))
         except Exception:
             pass
 
@@ -143,10 +180,24 @@ def main() -> int:
 
     def quit_app() -> None:
         log.info("quit requested")
+        try:
+            fans = sensors.read_fans()
+            indices = {f.index for f in fans if f.manual}
+            if win.is_manual_mode():
+                indices.add(1)
+            for index in indices:
+                ok, message = mbpfan_ctrl.manual_off(index)
+                if not ok:
+                    QMessageBox.critical(win, "Fresh Fan Manager", tr("fan_auto_failed", error=message))
+                    return
+        except Exception as exc:
+            log.error(f"Fan shutdown check failed: {exc}")
+            if win.is_manual_mode():
+                return
         config.save(win.settings)
         try:
             win._timer.stop()
-            win._proc_timer.stop()
+            win._disk_timer.stop()
             win.stress.stop()
         except Exception:
             pass
@@ -155,6 +206,9 @@ def main() -> int:
 
     tray.quit_requested.connect(quit_app)
     win.quit_requested.connect(quit_app)
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        win.title_bar.close_requested.disconnect()
+        win.title_bar.close_requested.connect(quit_app)
 
     # Tray refresh
     refresh_timer = QTimer()
@@ -176,7 +230,8 @@ def main() -> int:
             if s.cpu_percent_total:
                 tip += f"  ·  CPU {s.cpu_percent_total:.0f}%"
             tray.update_tooltip(tip)
-            tray.update_state(temp, manual_mode=manual)
+            tray.update_state(temp, manual_mode=manual,
+                              show_temp_number=getattr(settings, "tray_show_temp", True))
         except Exception as e:
             log.error(f"tray refresh error: {e}")
 
@@ -191,21 +246,39 @@ def main() -> int:
     else:
         win.show()
 
-    QTimer.singleShot(800, lambda: _first_run_check(win, log))
-    return app.exec()
+    if args.settings:
+        QTimer.singleShot(600, win._open_preferences)
+    QTimer.singleShot(400, lambda: _first_run_check(win, tray, log))
+    result = app.exec()
+    lease.release()
+    return result
 
 
-def _first_run_check(win: MainWindow, log) -> None:
-    if not mbpfan_ctrl.is_installed():
-        log.info("mbpfan not installed at startup")
+def _first_run_check(win: MainWindow, tray: TrayController, log) -> None:
+    settings = win.settings
+    if not getattr(settings, "first_run_completed", False):
+        from ui.onboarding_dialog import OnboardingDialog
+        dlg = OnboardingDialog(win, settings)
+        if dlg.exec():
+            log.info(f"First-run onboarding completed: lang={settings.language}, tray_show_temp={settings.tray_show_temp}")
+            try:
+                s = sensors.snapshot(include_top_processes=False)
+                tray.update_state(s.cpu_temp_c, manual_mode=win.is_manual_mode(),
+                                  show_temp_number=settings.tray_show_temp)
+            except Exception:
+                pass
+
+    backend = mbpfan_ctrl.get_backend()
+    log.info(f"Cooling backend detected: {backend}")
+    if backend != "mbpfan":
         return
     status = mbpfan_ctrl.service_status()
     if status == "failed":
         log.warning("mbpfan service is in failed state at startup")
         msg = QMessageBox(win)
-        msg.setWindowTitle("mbpfan in errore")
-        msg.setText("Il servizio mbpfan risulta in stato 'failed'.\n"
-                    "Vuoi provare a riavviarlo ora?")
+        msg.setWindowTitle("mbpfan error")
+        msg.setText("The mbpfan service is in failed state.\n"
+                    "Would you like to try restarting it now?")
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if msg.exec() == QMessageBox.StandardButton.Yes:
             ok, out = mbpfan_ctrl.restart_service()
@@ -214,13 +287,10 @@ def _first_run_check(win: MainWindow, log) -> None:
 
 def _apply_preset(win: MainWindow, name: str) -> None:
     log = get_logger()
-    if not mbpfan_ctrl.is_installed():
-        QMessageBox.warning(win, "mbpfan", "mbpfan non è installato.")
+    if not mbpfan_ctrl.can_control_fan() and mbpfan_ctrl.get_backend() == "firmware":
+        QMessageBox.information(win, "Fresh Fan Manager", "Fan is managed by system firmware.")
         return
-    ok, msg = mbpfan_ctrl.apply_preset(name)
-    log.info(f"Preset {name}: ok={ok} {msg}")
-    if not ok:
-        QMessageBox.critical(win, "Preset fallito", msg)
+    win._apply_preset(name)
 
 
 def _open_tweaks(win: MainWindow) -> None:

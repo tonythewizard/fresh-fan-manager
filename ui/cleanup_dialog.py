@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Advanced cleanup dialog with per-target checkboxes and size estimates."""
 from __future__ import annotations
 
@@ -6,12 +7,13 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                 QPushButton, QCheckBox, QFrame, QMessageBox)
 
 from core import sys_actions, sensors
+from core.i18n import tr
 
 
 class CleanupDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Cleanup avanzato")
+        self.setWindowTitle(tr("cleanup_title"))
         self.setMinimumWidth(440)
         self.setModal(True)
 
@@ -20,8 +22,10 @@ class CleanupDialog(QDialog):
         lay.setSpacing(8)
 
         intro = QLabel(
-            "Scegli cosa pulire. Le voci marcate con 🔐 richiedono i privilegi "
-            "di amministratore."
+            tr("desc_user_cache") if False else
+            "Select targets to clean. Items marked with 🔐 require root privileges."
+            if tr("save") == "Save" else
+            "Scegli cosa pulire. Le voci marcate con 🔐 richiedono i privilegi di amministratore."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: rgba(255,255,255,200); font-size: 11px;")
@@ -59,10 +63,10 @@ class CleanupDialog(QDialog):
         # Buttons
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self.btn_cancel = QPushButton("Annulla")
+        self.btn_cancel = QPushButton(tr("cancel"))
         self.btn_cancel.clicked.connect(self.reject)
         btn_row.addWidget(self.btn_cancel)
-        self.btn_run = QPushButton("Pulisci")
+        self.btn_run = QPushButton(tr("clean_system").rstrip("…"))
         self.btn_run.setDefault(True)
         self.btn_run.clicked.connect(self._run)
         btn_row.addWidget(self.btn_run)

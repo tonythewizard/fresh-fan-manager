@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 macfan-helper — privileged operations dispatcher.
 
@@ -9,6 +10,7 @@ and is referenced by /usr/share/polkit-1/actions/org.macfan.monitor.policy
 from __future__ import annotations
 
 import os
+import re
 import sys
 import shutil
 import subprocess
@@ -17,8 +19,31 @@ from pathlib import Path
 from typing import Optional
 
 MBPFAN_CONF = Path("/etc/mbpfan.conf")
-SMC_PATH = Path("/sys/devices/platform/applesmc.768")
 CPU_BASE = Path("/sys/devices/system/cpu")
+
+def find_smc_path() -> Path:
+    """Locate Apple SMC sysfs directory dynamically."""
+    candidates = [
+        Path("/sys/devices/platform/applesmc.768"),
+        Path("/sys/devices/platform/applesmc"),
+    ]
+    for c in candidates:
+        if c.exists() and (c / "fan1_manual").exists():
+            return c
+    for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+        try:
+            name_file = hw / "name"
+            if name_file.exists() and name_file.read_text().strip() == "applesmc":
+                if (hw / "fan1_manual").exists():
+                    return hw
+        except Exception:
+            pass
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[0]
+
+SMC_PATH = find_smc_path()
 
 ALLOWED_GOVERNORS = {"performance", "powersave", "ondemand",
                      "conservative", "schedutil", "userspace"}
@@ -82,18 +107,42 @@ def cmd_enable_mbpfan() -> int:
 
 
 def cmd_install_mbpfan() -> int:
-    env = os.environ.copy()
-    env["DEBIAN_FRONTEND"] = "noninteractive"
-    r = subprocess.run(["apt-get", "update"], capture_output=True, text=True, env=env)
-    sys.stdout.write(r.stdout)
-    sys.stderr.write(r.stderr)
-    if r.returncode != 0:
+    if shutil.which("pacman"):
+        tmp_dir = tempfile.mkdtemp(prefix="mbpfan-")
+        try:
+            r = subprocess.run(["git", "clone", "--depth", "1", "https://github.com/linux-on-mac/mbpfan.git", tmp_dir],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                sys.stderr.write(r.stderr)
+                return r.returncode
+            subprocess.run(["make", "-C", tmp_dir], check=True)
+            subprocess.run(["make", "-C", tmp_dir, "install"], check=True)
+            svc_file = Path(tmp_dir) / "mbpfan.service"
+            if svc_file.exists():
+                shutil.copy(svc_file, "/usr/lib/systemd/system/mbpfan.service")
+                subprocess.run(["systemctl", "daemon-reload"])
+            return 0
+        except Exception as e:
+            sys.stderr.write(str(e))
+            return 1
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    elif shutil.which("apt-get"):
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        r = subprocess.run(["apt-get", "update"], capture_output=True, text=True, env=env)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        if r.returncode != 0:
+            return r.returncode
+        r = subprocess.run(["apt-get", "install", "-y", "mbpfan"],
+                           capture_output=True, text=True, env=env)
+        sys.stdout.write(r.stdout)
+        sys.stderr.write(r.stderr)
         return r.returncode
-    r = subprocess.run(["apt-get", "install", "-y", "mbpfan"],
-                       capture_output=True, text=True, env=env)
-    sys.stdout.write(r.stdout)
-    sys.stderr.write(r.stderr)
-    return r.returncode
+    else:
+        sys.stderr.write("No supported package manager found.\n")
+        return 1
 
 
 def cmd_set_governor(name: str) -> int:
@@ -115,7 +164,7 @@ def cmd_set_governor(name: str) -> int:
 
 
 def cmd_set_fan_manual(fan_idx: str, on: str) -> int:
-    if not fan_idx.isdigit():
+    if not fan_idx.isdigit() or not 1 <= int(fan_idx) <= 10:
         _die("bad fan index")
     if on not in ("0", "1"):
         _die("on must be 0 or 1")
@@ -128,7 +177,7 @@ def cmd_set_fan_manual(fan_idx: str, on: str) -> int:
 
 
 def cmd_set_fan_output(fan_idx: str, rpm: str) -> int:
-    if not fan_idx.isdigit():
+    if not fan_idx.isdigit() or not 1 <= int(fan_idx) <= 10:
         _die("bad fan index")
     if not rpm.isdigit():
         _die("rpm must be an integer")
@@ -146,7 +195,7 @@ def cmd_set_fan_output(fan_idx: str, rpm: str) -> int:
 def cmd_manual_on(fan_idx: str, rpm: str) -> int:
     """Atomic: stop mbpfan, set fan to manual, write RPM. Safer than three
     separate pkexec calls."""
-    if not fan_idx.isdigit():
+    if not fan_idx.isdigit() or not 1 <= int(fan_idx) <= 10:
         _die("bad fan index")
     if not rpm.isdigit():
         _die("rpm must be an integer")
@@ -163,29 +212,35 @@ def cmd_manual_on(fan_idx: str, rpm: str) -> int:
     subprocess.run(["systemctl", "stop", "mbpfan"], capture_output=True, text=True)
     # Engage manual mode
     fan_manual.write_text("1")
-    # Write RPM
-    fan_output.write_text(str(rpm_i))
+    # Roll back manual mode if the target cannot be written.
+    try:
+        fan_output.write_text(str(rpm_i))
+    except OSError:
+        fan_manual.write_text("0")
+        raise
     print(f"ok manual on rpm={rpm_i}")
     return 0
 
 
 def cmd_manual_off(fan_idx: str) -> int:
     """Atomic: clear manual flag, restart mbpfan."""
-    if not fan_idx.isdigit():
+    if not fan_idx.isdigit() or not 1 <= int(fan_idx) <= 10:
         _die("bad fan index")
     fan_manual = SMC_PATH / f"fan{fan_idx}_manual"
-    if fan_manual.exists():
-        try:
-            fan_manual.write_text("0")
-        except Exception as e:
-            print(f"warning: could not clear manual flag: {e}", file=sys.stderr)
-    # Restart mbpfan so the daemon retakes control (with reset-failed safety)
-    rc, out, err = _restart_with_reset("mbpfan")
-    sys.stdout.write(out)
-    sys.stderr.write(err)
-    if rc != 0:
-        # Not fatal: manual flag is cleared, the kernel falls back to its own logic
-        print("(mbpfan restart failed, but fan returned to auto)", file=sys.stderr)
+    if not fan_manual.exists():
+        _die("applesmc fan manual flag missing")
+    try:
+        fan_manual.write_text("0")
+    except OSError as exc:
+        _die(f"cannot restore automatic fan control: {exc}")
+    # Only restart an installed external controller; the firmware owns auto
+    # when mbpfan is absent. A restart error is surfaced to the caller.
+    if shutil.which("mbpfan"):
+        rc, out, err = _restart_with_reset("mbpfan")
+        sys.stdout.write(out)
+        sys.stderr.write(err)
+        if rc != 0:
+            return rc
     print("ok manual off")
     return 0
 
@@ -202,75 +257,438 @@ def cmd_drop_caches() -> int:
 
 
 def cmd_cleanup(keys: list[str]) -> int:
-    """Run the requested cleanup actions. Privileged-side counterpart of
-    core.sys_actions.run_cleanup."""
-    valid = {"drop_caches", "journal", "apt",
-             "thumbnails", "user_cache", "trash"}
-    keys = [k for k in keys if k in valid]
-    if not keys:
-        _die("no valid cleanup keys")
-    # Resolve the calling user's home dir (pkexec runs as root)
-    real_home: Optional[Path] = None
-    uid = os.environ.get("PKEXEC_UID")
-    if uid:
-        try:
-            import pwd
-            real_home = Path(pwd.getpwuid(int(uid)).pw_dir)
-        except Exception:
-            real_home = None
-    if real_home is None:
-        real_home = Path.home()
-
-    errors: list[str] = []
-    for k in keys:
-        try:
-            if k == "drop_caches":
-                subprocess.run(["sync"], capture_output=True, text=True)
-                Path("/proc/sys/vm/drop_caches").write_text("3\n")
-            elif k == "journal":
-                subprocess.run(["journalctl", "--vacuum-size=100M"],
-                               capture_output=True, text=True, timeout=30)
-            elif k == "apt":
-                subprocess.run(["apt-get", "clean"],
-                               capture_output=True, text=True, timeout=30)
-            elif k == "thumbnails":
-                _rm_tree(real_home / ".cache" / "thumbnails")
-            elif k == "user_cache":
-                cache = real_home / ".cache"
-                if cache.exists():
-                    for child in cache.iterdir():
-                        if child.name == "thumbnails":
-                            continue
-                        _rm_tree(child)
-            elif k == "trash":
-                _rm_tree(real_home / ".local" / "share" / "Trash")
-        except Exception as e:
-            errors.append(f"{k}: {e}")
-    if errors:
-        _die("; ".join(errors))
+    """Only system targets run as root; user caches are cleaned by the GUI."""
+    valid = {"drop_caches", "journal", "apt", "pkg_cache"}
+    if not keys or any(key not in valid for key in keys):
+        _die("invalid system cleanup target")
+    for key in dict.fromkeys(keys):
+        if key == "drop_caches":
+            cmd_drop_caches()
+        elif key == "journal":
+            subprocess.run(["journalctl", "--vacuum-size=100M"], check=True,
+                           capture_output=True, text=True, timeout=30)
+        else:
+            if shutil.which("pacman"):
+                command = ["pacman", "-Sc", "--noconfirm"]
+            elif shutil.which("apt-get"):
+                command = ["apt-get", "clean"]
+            elif shutil.which("dnf"):
+                command = ["dnf", "clean", "all"]
+            else:
+                _die("no supported package cache cleaner")
+            subprocess.run(command, check=True, capture_output=True, text=True, timeout=30)
     print(f"ok cleaned {','.join(keys)}")
     return 0
 
 
-def _rm_tree(p: Path) -> None:
-    """Delete contents of p but keep the directory itself (so apps can recreate)."""
+def cmd_set_thinkpad_fan(level: str) -> int:
+    """Set ThinkPad fan level (0-7, auto, disengaged)."""
+    p = Path("/proc/acpi/ibm/fan")
     if not p.exists():
-        return
-    if not p.is_dir():
+        _die("ThinkPad fan interface /proc/acpi/ibm/fan not found")
+    valid_levels = {"0", "1", "2", "3", "4", "5", "6", "7", "auto", "disengaged", "full-speed"}
+    if level not in valid_levels:
+        _die(f"invalid thinkpad fan level: {level}")
+    try:
+        p.write_text(f"level {level}\n")
+        print(f"ok thinkpad fan level={level}")
+        return 0
+    except Exception as e:
+        _die(f"failed to set thinkpad fan level: {e}")
+
+
+def cmd_set_asus_profile(mode: str) -> int:
+    """Set ASUS thermal policy (0=Normal, 1=Boost, 2=Silent)."""
+    paths = [
+        Path("/sys/devices/platform/asus-nb-wmi/throttle_thermal_policy"),
+        Path("/sys/devices/platform/asus-nb-wmi/fan_boost_mode"),
+    ]
+    if mode not in ("0", "1", "2"):
+        _die(f"invalid asus mode: {mode}")
+    written = False
+    for p in paths:
+        if p.exists():
+            try:
+                p.write_text(f"{mode}\n")
+                written = True
+            except Exception:
+                pass
+    if not written:
+        _die("ASUS WMI thermal interface not found")
+    print(f"ok asus mode={mode}")
+    return 0
+
+
+def cmd_set_dell_profile(mode: str) -> int:
+    """Set Dell laptop thermal profile (quiet, balanced, performance, cool)."""
+    p = Path("/sys/devices/platform/dell-laptop/thermal_profile")
+    if not p.exists():
+        _die("Dell thermal profile interface not found")
+    valid_modes = {"quiet", "balanced", "performance", "cool"}
+    if mode not in valid_modes:
+        _die(f"invalid dell thermal mode: {mode}")
+    try:
+        p.write_text(f"{mode}\n")
+        print(f"ok dell mode={mode}")
+        return 0
+    except Exception as e:
+        _die(f"failed to set dell thermal profile: {e}")
+
+
+def cmd_set_pwm(hwmon_name: str, pwm_idx: str, val: str) -> int:
+    """Set generic Linux hwmon PWM value (0-255)."""
+    if not re.fullmatch(r"hwmon[0-9]+", hwmon_name):
+        _die("invalid hwmon device name")
+    if not pwm_idx.isdigit() or not 1 <= int(pwm_idx) <= 9 or not val.isdigit():
+        _die("pwm index and value must be numbers")
+    v = int(val)
+    if not (0 <= v <= 255):
+        _die("pwm value must be between 0 and 255")
+    # Locate hwmon path
+    base = Path("/sys/class/hwmon")
+    target_hw = None
+    if (base / hwmon_name).exists():
+        target_hw = base / hwmon_name
+    else:
+        for hw in base.glob("hwmon*"):
+            if hw.name == hwmon_name:
+                target_hw = hw
+                break
+    if target_hw is None:
+        _die(f"hwmon device {hwmon_name} not found")
+
+    target_pwm = target_hw / f"pwm{pwm_idx}"
+    if not target_pwm.exists():
+        _die(f"pwm file {target_pwm} not found")
+    try:
+        target_pwm.write_text(f"{v}\n")
+        print(f"ok pwm={v}")
+        return 0
+    except Exception as e:
+        _die(f"failed to write pwm: {e}")
+
+
+def cmd_set_pwm_enable(hwmon_name: str, pwm_idx: str, mode: str) -> int:
+    """Set generic Linux hwmon PWM enable mode (1=manual, 2=auto)."""
+    if not re.fullmatch(r"hwmon[0-9]+", hwmon_name):
+        _die("invalid hwmon device name")
+    if not pwm_idx.isdigit() or not 1 <= int(pwm_idx) <= 9:
+        _die("pwm index must be a number")
+    if mode not in ("0", "1", "2"):
+        _die("pwm enable mode must be 0, 1, or 2")
+    base = Path("/sys/class/hwmon")
+    target_hw = base / hwmon_name if (base / hwmon_name).exists() else None
+    if target_hw is None:
+        for hw in base.glob("hwmon*"):
+            if hw.name == hwmon_name:
+                target_hw = hw
+                break
+    if target_hw is None:
+        _die(f"hwmon device {hwmon_name} not found")
+
+    target_en = target_hw / f"pwm{pwm_idx}_enable"
+    if not target_en.exists():
+        _die(f"pwm_enable file {target_en} not found")
+    try:
+        target_en.write_text(f"{mode}\n")
+        print(f"ok pwm_enable={mode}")
+        return 0
+    except Exception as e:
+        _die(f"failed to write pwm_enable: {e}")
+
+
+def cmd_set_cooling_state(idx: str, state: str) -> int:
+    """Set ACPI cooling device state."""
+    if not idx.isdigit() or not state.isdigit():
+        _die("index and state must be integers")
+    p = Path(f"/sys/class/thermal/cooling_device{idx}/cur_state")
+    if not p.exists():
+        _die(f"cooling device {p} not found")
+    try:
+        p.write_text(f"{state}\n")
+        print(f"ok cooling_device{idx}={state}")
+        return 0
+    except Exception as e:
+        _die(f"failed to set cooling state: {e}")
+
+
+def cmd_set_turbo(on: str) -> int:
+    """Enable ('1') or disable ('0') CPU Turbo Boost."""
+    if on not in ("0", "1"):
+        _die("on must be 0 or 1")
+    pstate = Path("/sys/devices/system/cpu/intel_pstate/no_turbo")
+    boost = Path("/sys/devices/system/cpu/cpufreq/boost")
+    done = False
+    if pstate.exists():
+        val = "0" if on == "1" else "1"
+        pstate.write_text(val + "\n")
+        done = True
+    if boost.exists():
+        boost.write_text(on + "\n")
+        done = True
+    if not done:
+        _die("no turbo control interface found")
+    print(f"ok turbo={on}")
+    return 0
+
+
+def cmd_set_brightness(pct_str: str) -> int:
+    """Set screen backlight percentage (1-100)."""
+    try:
+        pct = int(pct_str)
+    except ValueError:
+        _die("brightness must be an integer percentage")
+    pct = max(1, min(100, pct))
+    bpaths = list(Path("/sys/class/backlight").glob("*"))
+    if not bpaths:
+        _die("no backlight device found")
+    bpath = bpaths[0]
+    max_b_path = bpath / "max_brightness"
+    cur_b_path = bpath / "brightness"
+    if not max_b_path.exists() or not cur_b_path.exists():
+        _die("backlight files missing")
+    max_b = int(max_b_path.read_text().strip())
+    target = max(1, int(round(max_b * pct / 100.0)))
+    cur_b_path.write_text(str(target) + "\n")
+    print(f"ok brightness={pct}")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# macsmc /dev/smc Native Fan Control
+# --------------------------------------------------------------------------
+
+def _smc_key(s: str) -> int:
+    b = s.encode("ascii").ljust(4, b" ")
+    return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
+
+
+def _smc_read(fd: int, key: str, size: int) -> Optional[bytes]:
+    import fcntl, struct
+    try:
+        k = _smc_key(key)
+        payload = bytearray(struct.pack("<IIQ32s", k, 0, size, b"\x00" * 32))
+        fcntl.ioctl(fd, 0xC0305301, payload)
+        return bytes(payload[16 : 16 + size])
+    except Exception:
+        return None
+
+
+def _smc_write(fd: int, key: str, data: bytes) -> bool:
+    import fcntl, struct
+    try:
+        k = _smc_key(key)
+        size = len(data)
+        pad = data.ljust(32, b"\x00")
+        payload = bytearray(struct.pack("<IIQ32s", k, 0, size, pad))
+        fcntl.ioctl(fd, 0x40305302, payload)
+        return True
+    except Exception:
+        return False
+
+
+def _trusted_library(path: Path) -> bool:
+    """Only load root-owned files beneath root-owned, non-writable parents."""
+    import stat
+    try:
+        for item in (path, *path.parents):
+            st = item.lstat()
+            if st.st_uid != 0 or st.st_mode & 0o022 or stat.S_ISLNK(st.st_mode):
+                return False
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _port_io_set_fan(fan_idx: int, rpm: int, manual: bool) -> bool:
+    # The raw-port fallback is restricted to Intel Apple hardware. Never load
+    # code from a development checkout, user directory or environment variable.
+    import platform
+    import ctypes
+    import fcntl
+    if platform.machine() not in ("x86_64", "i386", "i686"):
+        return False
+    try:
+        if "Apple" not in Path("/sys/class/dmi/id/sys_vendor").read_text():
+            return False
+        library = Path("/opt/fresh-fan-manager/bin/libsmc_port.so")
+        if not _trusted_library(library):
+            return False
+        state_dir = Path("/run/fresh-fan-manager")
+        state_dir.mkdir(mode=0o700, exist_ok=True)
+        st = state_dir.lstat()
+        if state_dir.is_symlink() or st.st_uid != 0 or st.st_mode & 0o077:
+            return False
+        lock_fd = os.open(str(state_dir / "smc.lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
-            p.unlink()
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            lib = ctypes.CDLL(str(library))
+            for name in ("smc_port_set_fan_manual", "smc_port_set_fan_auto"):
+                func = getattr(lib, name)
+                func.argtypes = [ctypes.c_int, ctypes.c_int]
+                func.restype = ctypes.c_int
+            lib.smc_port_get_fan_min.argtypes = [ctypes.c_int]
+            lib.smc_port_get_fan_min.restype = ctypes.c_int
+            saved = state_dir / f"fan{fan_idx}-minimum"
+            if manual:
+                if not saved.exists():
+                    minimum = lib.smc_port_get_fan_min(fan_idx)
+                    if minimum < 0:
+                        return False
+                    saved.write_text(str(minimum))
+                minimum = int(saved.read_text())
+                return lib.smc_port_set_fan_manual(fan_idx, max(minimum, rpm)) == 0
+            if not saved.exists():
+                # No native override in this boot: use the regular ioctl path.
+                return False
+            ok = lib.smc_port_set_fan_auto(fan_idx, int(saved.read_text())) == 0
+            if ok:
+                saved.unlink()
+            return ok
+        finally:
+            os.close(lock_fd)
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def cmd_manual_on_macsmc(fan_idx: str, rpm: str) -> int:
+    if not fan_idx.isdigit() or not 1 <= int(fan_idx) <= 10 or not rpm.isdigit():
+        _die("bad arguments")
+    rpm_i = int(rpm)
+    idx_num = int(fan_idx)
+    idx = max(0, idx_num - 1)
+
+    # 1. Try direct hardware port I/O on x86 Intel Macs
+    if _port_io_set_fan(idx_num, rpm_i, True):
+        print(f"ok macsmc manual on rpm={rpm_i}")
+        return 0
+
+    smc_dev = Path("/dev/smc")
+    if not smc_dev.exists():
+        _die("/dev/smc not found")
+    try:
+        fd = os.open(str(smc_dev), os.O_RDWR)
+    except Exception as e:
+        _die(f"cannot open /dev/smc: {e}")
+    try:
+        # Set manual bit in FS! (Intel Mac)
+        fs_buf = _smc_read(fd, "FS! ", 2)
+        w1 = False
+        if fs_buf and len(fs_buf) >= 2:
+            mask = (fs_buf[0] << 8) | fs_buf[1]
+            mask |= (1 << idx)
+            w1 = _smc_write(fd, "FS! ", bytes([(mask >> 8) & 0xFF, mask & 0xFF]))
+        # Write mode key F{idx}Md (T2 / Apple Silicon)
+        w2 = _smc_write(fd, f"F{idx}Md", bytes([1]))
+        # Write RPM to F{idx}Tg
+        val = max(0, min(8000, rpm_i)) << 2
+        w3 = _smc_write(fd, f"F{idx}Tg", bytes([(val >> 8) & 0xFF, val & 0xFF]))
+        if (w1 or w2) and w3:
+            print(f"ok macsmc manual on rpm={rpm_i}")
+            return 0
+        _die("cannot set fan speed: hardware port I/O and /dev/smc write both failed")
+    finally:
+        os.close(fd)
+
+
+def cmd_manual_off_macsmc(fan_idx: str) -> int:
+    if not fan_idx.isdigit() or not 1 <= int(fan_idx) <= 10:
+        _die("bad fan index")
+    idx_num = int(fan_idx)
+    idx = max(0, idx_num - 1)
+
+    # 1. Try direct hardware port I/O on x86 Intel Macs
+    if _port_io_set_fan(idx_num, 0, False):
+        print("ok macsmc manual off")
+        return 0
+
+    if Path(f"/run/fresh-fan-manager/fan{idx_num}-minimum").exists():
+        _die("Native SMC restoration failed; saved hardware limits retained for retry")
+    smc_dev = Path("/dev/smc")
+    if not smc_dev.exists():
+        _die("/dev/smc not found")
+    try:
+        fd = os.open(str(smc_dev), os.O_RDWR)
+    except Exception as e:
+        _die(f"cannot open /dev/smc: {e}")
+    try:
+        # Clear bit in FS! (Intel Mac)
+        fs_buf = _smc_read(fd, "FS! ", 2)
+        w1 = False
+        if fs_buf and len(fs_buf) >= 2:
+            mask = (fs_buf[0] << 8) | fs_buf[1]
+            mask &= ~(1 << idx)
+            w1 = _smc_write(fd, "FS! ", bytes([(mask >> 8) & 0xFF, mask & 0xFF]))
+        # Clear F{idx}Md (T2 / Apple Silicon)
+        w2 = _smc_write(fd, f"F{idx}Md", bytes([0]))
+        if w1 or w2:
+            print("ok macsmc manual off")
+            return 0
+        _die("cannot reset fan: hardware port I/O and /dev/smc write both failed")
+    finally:
+        os.close(fd)
+
+
+def cmd_set_macsmc_fan_rpm(fan_idx: str, rpm: str) -> int:
+    return cmd_manual_on_macsmc(fan_idx, rpm)
+
+
+def cmd_setup_smc_udev() -> int:
+    rules = Path("/etc/udev/rules.d/99-macsmc.rules")
+    rules.write_text('# Apple SMC permissions for Fresh Fan Manager\nKERNEL=="smc", SUBSYSTEM=="misc", MODE="0644"\n')
+    os.chmod(rules, 0o644)
+    subprocess.run(["udevadm", "control", "--reload-rules"], capture_output=True)
+    subprocess.run(["udevadm", "trigger", "--subsystem-match=misc"], capture_output=True)
+    smc = Path("/dev/smc")
+    if smc.exists():
+        try:
+            os.chmod(smc, 0o644)
         except Exception:
             pass
-        return
-    import shutil
-    for child in p.iterdir():
-        try:
-            if child.is_dir() and not child.is_symlink():
-                shutil.rmtree(child, ignore_errors=True)
-            else:
-                child.unlink()
-        except Exception:
-            pass
+    print("ok smc-udev configured")
+    return 0
+
+
+def cmd_read_macsmc_fans() -> int:
+    import json
+    smc_dev = Path("/dev/smc")
+    if not smc_dev.exists():
+        print("[]")
+        return 0
+    try:
+        fd = os.open(str(smc_dev), os.O_RDONLY)
+    except Exception:
+        print("[]")
+        return 0
+    fans = []
+    try:
+        fnum_data = _smc_read(fd, "FNum", 1)
+        fnum = fnum_data[0] if fnum_data else 0
+        if fnum == 0 and _smc_read(fd, "F0Ac", 2) is not None:
+            fnum = 1
+        fs_buf = _smc_read(fd, "FS! ", 2)
+        mask = ((fs_buf[0] << 8) | fs_buf[1]) if fs_buf and len(fs_buf) >= 2 else 0
+
+        for i in range(fnum):
+            ac_buf = _smc_read(fd, f"F{i}Ac", 2)
+            rpm = (((ac_buf[0] << 8) | ac_buf[1]) >> 2) if ac_buf and len(ac_buf) >= 2 else 0
+            mn_buf = _smc_read(fd, f"F{i}Mn", 2)
+            mn = (((mn_buf[0] << 8) | mn_buf[1]) >> 2) if mn_buf and len(mn_buf) >= 2 else 1200
+            mx_buf = _smc_read(fd, f"F{i}Mx", 2)
+            mx = (((mx_buf[0] << 8) | mx_buf[1]) >> 2) if mx_buf and len(mx_buf) >= 2 else 6500
+            manual = bool((mask >> i) & 1)
+            fans.append({
+                "index": i + 1,
+                "label": f"Fan {i + 1}" if fnum > 1 else "Mac Fan",
+                "rpm": rpm,
+                "min_rpm": mn,
+                "max_rpm": mx,
+                "manual": manual,
+            })
+    finally:
+        os.close(fd)
+    print(json.dumps(fans))
+    return 0
 
 
 def main() -> int:
@@ -283,17 +701,32 @@ def main() -> int:
     args = sys.argv[2:]
 
     handlers = {
-        "write-conf":      lambda: cmd_write_conf(),
-        "restart-mbpfan":  lambda: cmd_restart_mbpfan(),
-        "enable-mbpfan":   lambda: cmd_enable_mbpfan(),
-        "install-mbpfan":  lambda: cmd_install_mbpfan(),
-        "set-governor":    lambda: cmd_set_governor(args[0]),
-        "set-fan-manual":  lambda: cmd_set_fan_manual(args[0], args[1]),
-        "set-fan-output":  lambda: cmd_set_fan_output(args[0], args[1]),
-        "manual-on":       lambda: cmd_manual_on(args[0], args[1]),
-        "manual-off":      lambda: cmd_manual_off(args[0]),
-        "drop-caches":     lambda: cmd_drop_caches(),
-        "cleanup":         lambda: cmd_cleanup(args),
+        "write-conf":         lambda: cmd_write_conf(),
+        "restart-mbpfan":     lambda: cmd_restart_mbpfan(),
+        "enable-mbpfan":      lambda: cmd_enable_mbpfan(),
+        "install-mbpfan":     lambda: cmd_install_mbpfan(),
+        "set-governor":       lambda: cmd_set_governor(args[0]),
+        "set-fan-manual":     lambda: cmd_set_fan_manual(args[0], args[1]),
+        "set-fan-output":     lambda: cmd_set_fan_output(args[0], args[1]),
+        "manual-on":          lambda: cmd_manual_on(args[0], args[1]),
+        "manual-off":         lambda: cmd_manual_off(args[0]),
+        "drop-caches":        lambda: cmd_drop_caches(),
+        "cleanup":            lambda: cmd_cleanup(args),
+        "set-turbo":          lambda: cmd_set_turbo(args[0]),
+        "set-brightness":     lambda: cmd_set_brightness(args[0]),
+        # Universal Laptop Controls
+        "set-thinkpad-fan":   lambda: cmd_set_thinkpad_fan(args[0]),
+        "set-asus-profile":   lambda: cmd_set_asus_profile(args[0]),
+        "set-dell-profile":   lambda: cmd_set_dell_profile(args[0]),
+        "set-pwm":            lambda: cmd_set_pwm(args[0], args[1], args[2]),
+        "set-pwm-enable":     lambda: cmd_set_pwm_enable(args[0], args[1], args[2]),
+        "set-cooling-state":  lambda: cmd_set_cooling_state(args[0], args[1]),
+        # macsmc /dev/smc Fan Controls
+        "manual-on-macsmc":   lambda: cmd_manual_on_macsmc(args[0], args[1]),
+        "manual-off-macsmc":  lambda: cmd_manual_off_macsmc(args[0]),
+        "set-macsmc-fan-rpm": lambda: cmd_set_macsmc_fan_rpm(args[0], args[1]),
+        "setup-smc-udev":     lambda: cmd_setup_smc_udev(),
+        "read-macsmc-fans":   lambda: cmd_read_macsmc_fans(),
     }
     fn = handlers.get(sub)
     if fn is None:

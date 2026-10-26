@@ -42,6 +42,9 @@ ENV/
 *.tar
 *.tar.xz
 *.zip
+*.pkg.tar.zst
+pkg/
+src/
 
 # --- App runtime state ---
 # Local user configuration (per-machine, not for version control)

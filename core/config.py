@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Persistent user settings.
 """
@@ -17,6 +18,11 @@ LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / "settings.json"
 
 @dataclass
 class Settings:
+    # First-run onboarding wizard
+    first_run_completed: bool = False
+    # Language: "en", "it", "es", "fr", "de", "pt", "ru", "zh", "ja", "ar", "hi"
+    language: str = "en"
+    tray_show_temp: bool = True
     # Appearance
     opacity: float = 0.92
     temp_font_px: int = 60               # user-configurable: 30–80
@@ -43,19 +49,30 @@ class Settings:
     mini_mode: bool = False              # tiny floating mode (just temp + fan)
     mini_x: int = -1
     mini_y: int = -1
+    # Updates: network access is opt-in; 0=manual, 24=daily, 168=weekly.
+    update_interval_hours: int = 0
+    update_last_attempt: float = 0.0
     # Misc
     show_top_processes: bool = True
     top_processes_count: int = 5
     top_processes_expanded: bool = False
     active_preset: str = ""
 
+    # View mode: "all" (all visible widgets) or "essentials" (only widgets above the divider)
+    view_mode: str = "all"
+    # Widget density/sizing: "compact", "normal", "expanded"
+    widget_sizes: dict[str, str] = field(default_factory=dict)
+
     # Widget system: ordered list of section keys, plus per-section visibility
     widget_order: list[str] = field(default_factory=lambda: [
-        "cpu", "fan", "maintenance", "ram", "gpu_battery", "throttle", "disk", "stress",
+        "cpu", "fan", "power", "quick_controls", "__essentials_divider__",
+        "network", "cpu_cores", "ram", "gpu_battery", "throttle", "disk", "stress", "maintenance",
     ])
     widget_visible: dict[str, bool] = field(default_factory=lambda: {
-        "cpu": True, "fan": True, "maintenance": True, "ram": True,
-        "gpu_battery": True, "throttle": True, "disk": False, "stress": True,
+        "cpu": True, "fan": True, "power": True, "quick_controls": True,
+        "__essentials_divider__": True, "network": True, "cpu_cores": True,
+        "ram": True, "gpu_battery": True, "throttle": True, "disk": True,
+        "stress": True, "maintenance": True,
     })
 
     def clamped_opacity(self) -> float:
@@ -66,9 +83,12 @@ class Settings:
 
 
 def load() -> Settings:
+    from core import i18n
     src = CONFIG_FILE if CONFIG_FILE.exists() else LEGACY_CONFIG_FILE
     if not src.exists():
-        return Settings()
+        s = Settings()
+        i18n.set_language(s.language)
+        return s
     try:
         data = json.loads(src.read_text())
         s = Settings()
@@ -89,15 +109,21 @@ def load() -> Settings:
             if k == "widget_order" and isinstance(v, list):
                 deprecated = {"mbpfan", "top_procs"}
                 saved = [x for x in v if isinstance(x, str) and x not in deprecated]
+                if "__essentials_divider__" not in saved:
+                    insert_idx = min(3, len(saved))
+                    saved.insert(insert_idx, "__essentials_divider__")
                 for default_key in s.widget_order:
                     if default_key not in saved:
                         saved.append(default_key)
                 s.widget_order = saved
                 continue
             setattr(s, k, v)
+        i18n.set_language(s.language)
         return s
     except Exception:
-        return Settings()
+        s = Settings()
+        i18n.set_language(s.language)
+        return s
 
 
 def save(settings: Settings) -> None:

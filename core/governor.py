@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Read and switch CPU governor across all online cores.
 Switching is routed through the pkexec helper.

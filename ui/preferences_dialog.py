@@ -1,6 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
-Preferences dialog: aspetto (tema, effetti, dimensione temp), alert,
-sicurezza override manuale, server grafico.
+Preferences dialog: appearance, alerts, language, and system configuration.
 """
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                 QSpinBox, QCheckBox, QComboBox, QPushButton,
                                 QSlider, QFrame, QTabWidget, QWidget)
 
-from core import config
+from core import config, mbpfan_ctrl
+from core.i18n import tr, set_language
 
 
 class PreferencesDialog(QDialog):
@@ -17,7 +18,7 @@ class PreferencesDialog(QDialog):
 
     def __init__(self, settings: config.Settings, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Preferenze")
+        self.setWindowTitle(tr("preferences"))
         self.setMinimumWidth(460)
         self._settings = settings
         self._restart_required = False
@@ -30,15 +31,16 @@ class PreferencesDialog(QDialog):
         tabs = QTabWidget()
         layout.addWidget(tabs, 1)
 
-        tabs.addTab(self._build_appearance_tab(), "Aspetto")
-        tabs.addTab(self._build_alerts_tab(), "Allerte")
-        tabs.addTab(self._build_advanced_tab(), "Avanzate")
+        tabs.addTab(self._build_general_tab(), tr("tab_general"))
+        tabs.addTab(self._build_appearance_tab(), tr("tab_appearance"))
+        tabs.addTab(self._build_alerts_tab(), tr("tab_alerts"))
+        tabs.addTab(self._build_advanced_tab(), tr("tab_advanced"))
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        cancel = QPushButton("Annulla")
+        cancel = QPushButton(tr("cancel"))
         cancel.clicked.connect(self.reject)
-        save = QPushButton("Salva")
+        save = QPushButton(tr("save"))
         save.setDefault(True)
         save.clicked.connect(self._save)
         btn_row.addWidget(cancel)
@@ -64,6 +66,58 @@ class PreferencesDialog(QDialog):
         lbl.setWordWrap(True)
         lbl.setStyleSheet(f"color: {muted}; font-size: 10px;")
         return lbl
+
+    def _build_general_tab(self) -> QWidget:
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(4, 8, 4, 8); lay.setSpacing(10)
+        s = self._settings
+
+        # Language selection
+        lay.addWidget(self._section_label(tr("language")))
+        lay.addWidget(self._info(tr("language_desc")))
+        row_lang = QHBoxLayout()
+        row_lang.addWidget(QLabel(f"{tr('language')}:"))
+        self.cb_lang = QComboBox()
+        self.cb_lang.setMinimumWidth(220)
+        from core.i18n import SUPPORTED_LANGUAGES
+        for code, name in SUPPORTED_LANGUAGES.items():
+            suffix = " (Default)" if code == "en" else ""
+            self.cb_lang.addItem(f"{name}{suffix}", code)
+        idx = self.cb_lang.findData(s.language)
+        if idx >= 0: self.cb_lang.setCurrentIndex(idx)
+        row_lang.addWidget(self.cb_lang); row_lang.addStretch()
+        lay.addLayout(row_lang)
+
+        # Tray options
+        lay.addWidget(self._section_label(tr("tray_icon_settings")))
+        self.chk_tray_temp = QCheckBox(tr("tray_style_numeric"))
+        self.chk_tray_temp.setChecked(getattr(s, "tray_show_temp", True))
+        lay.addWidget(self.chk_tray_temp)
+        lay.addWidget(self._info(tr("tray_style_numeric_desc")))
+
+        # Hardware backend detection
+        lay.addWidget(self._section_label("Hardware Backend"))
+        lay.addWidget(self._info(
+            "Auto-detected cooling backend and driver in use on this machine."
+        ))
+        backend_desc = mbpfan_ctrl.get_backend_description()
+        lbl_backend = QLabel(f"{tr('active_backend_label')} {backend_desc}")
+        lbl_backend.setStyleSheet("font-weight: 600; font-size: 11px; color: #7FD7FF;")
+        lay.addWidget(lbl_backend)
+
+        lay.addWidget(self._section_label(tr("updates")))
+        lay.addWidget(self._info(tr("update_privacy")))
+        self.cb_updates = QComboBox()
+        for label, hours in (("update_manual", 0), ("update_daily", 24), ("update_weekly", 168)):
+            self.cb_updates.addItem(tr(label), hours)
+        self.cb_updates.setCurrentIndex(max(0, self.cb_updates.findData(s.update_interval_hours)))
+        lay.addWidget(self.cb_updates)
+        check = QPushButton(tr("update_check"))
+        check.clicked.connect(lambda: self.parent().updates.check(manual=True))
+        lay.addWidget(check)
+        lay.addStretch()
+        return w
 
     def _build_appearance_tab(self) -> QWidget:
         w = QWidget()
@@ -281,6 +335,15 @@ class PreferencesDialog(QDialog):
         s.alert_temp_c = self.sp_alert.value()
         s.manual_safety_enabled = self.chk_safety.isChecked()
         s.manual_safety_temp_c = self.sp_safety.value()
+        s.tray_show_temp = self.chk_tray_temp.isChecked()
+        s.update_interval_hours = self.cb_updates.currentData()
+
+        new_lang = self.cb_lang.currentData()
+        if new_lang != s.language:
+            self._restart_required = True
+            self._appearance_dirty = True
+            s.language = new_lang
+            set_language(new_lang)
 
         new_display = self.cb_display.currentData()
         if new_display != s.display_server:

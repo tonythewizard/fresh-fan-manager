@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Mini-mode: a tiny always-on-top floating widget showing just temperature
 and fan RPM. Designed to be unobtrusive (~160x52 px).

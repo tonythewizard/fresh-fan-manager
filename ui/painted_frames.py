@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 RootFrame: replacement for the rootContainer QWidget. Paints its own
 rounded background (solid or gradient) and border using QPainter with
@@ -54,19 +55,22 @@ def retint_labels(root, theme: str) -> None:
     theme-appropriate (foreground, alpha) tuple. This is fully reversible
     across theme switches and idempotent."""
     from PySide6.QtWidgets import QLabel
-    if theme in ("light", "sepia", "solarized_light"):
+    if theme in ("light", "solarized_light"):
         fg = "20, 24, 32"
         min_alpha = 215
+    elif theme == "sepia":
+        fg = "50, 32, 16"
+        min_alpha = 220
     elif theme == "hicontrast":
         fg = "255, 255, 255"
-        min_alpha = 235
+        min_alpha = 245
     elif theme == "solarized_dark":
         fg = "238, 232, 213"
         min_alpha = 230
     else:
-        # Dark / dark default themes: revert to original whites if cached
+        # Dark / dark default themes: ensure legible contrast
         fg = "255, 255, 255"
-        min_alpha = 0
+        min_alpha = 175
 
     pattern = re.compile(
         r"color:\s*rgba\(\s*255\s*,\s*255\s*,\s*255\s*,\s*(\d+)\s*\)"
@@ -102,7 +106,9 @@ def retint_labels(root, theme: str) -> None:
 
 
 class RootFrame(QWidget):
-    """Top-level rounded container painted via QPainter (antialiased)."""
+    """Top-level rounded container painted via QPainter (antialiased).
+    When full screen or maximized, eliminates transparency and sharpens
+    corners to cover the display solidly and cleanly."""
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -122,6 +128,9 @@ class RootFrame(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
+        win = self.window()
+        is_fs = (win.isFullScreen() or win.isMaximized() or getattr(win, "_is_vert_maximized", False)) if win else False
+
         # Pick palette (theme + bg variant)
         palette = _styles.palette_for(
             self._settings.theme,
@@ -129,7 +138,27 @@ class RootFrame(QWidget):
             getattr(self._settings, "bg_variant", "default"),
         )
 
-        # Outer rounded rect with 0.5px inset so the stroke is fully inside
+        if is_fs:
+            # Fullscreen: completely eliminate transparency (alpha 255) and zero border radius
+            if self._settings.bg_effect == "gradient":
+                grad = QLinearGradient(0, 0, 0, self.height())
+                c_top = parse_rgba(palette["grad_top"])
+                c_top.setAlpha(255)
+                c_mid = parse_rgba(palette["grad_mid"])
+                c_mid.setAlpha(255)
+                c_bot = parse_rgba(palette["grad_bot"])
+                c_bot.setAlpha(255)
+                grad.setColorAt(0.0, c_top)
+                grad.setColorAt(0.5, c_mid)
+                grad.setColorAt(1.0, c_bot)
+                p.fillRect(self.rect(), grad)
+            else:
+                solid_col = parse_rgba(palette["root_bg"])
+                solid_col.setAlpha(255)
+                p.fillRect(self.rect(), solid_col)
+            return
+
+        # Normal windowed mode: outer rounded rect with 0.5px inset
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         radius = 14.0
         path = QPainterPath()
@@ -143,9 +172,6 @@ class RootFrame(QWidget):
             grad.setColorAt(1.0, parse_rgba(palette["grad_bot"]))
             p.fillPath(path, QBrush(grad))
         elif self._settings.bg_effect == "matrix":
-            # Matrix overlay paints on its own widget behind the sections.
-            # Root only fills a near-transparent base so the rounded mask is
-            # preserved and edges aren't sharp.
             if self._settings.theme in ("light", "sepia", "solarized_light"):
                 p.fillPath(path, QBrush(QColor(238, 242, 246, 230)))
             else:
@@ -249,8 +275,9 @@ class PaintedButton(QWidget):
         fm = QFontMetrics(self._font())
         w = fm.horizontalAdvance(self._text) + 2 * self._padding_h
         h = fm.height() + 2 * self._padding_v
-        self.setMinimumSize(max(40, w), h)
-        self._hint_w = max(40, w)
+        self.setMinimumHeight(h)
+        self.setMinimumWidth(max(28, min(w, 90)))
+        self._hint_w = max(36, w)
         self._hint_h = h
 
     def sizeHint(self):  # noqa: N802
@@ -335,10 +362,14 @@ class PaintedButton(QWidget):
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
 
-        # Text
+        # Text with elide safety
         p.setFont(self._font())
         p.setPen(text_col)
-        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._text)
+        from PySide6.QtGui import QFontMetrics
+        fm = QFontMetrics(self._font())
+        avail_w = max(10, int(rect.width() - 4))
+        disp_text = fm.elidedText(self._text, Qt.TextElideMode.ElideRight, avail_w)
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, disp_text)
 
 
 class PaintedTitleButton(PaintedButton):
@@ -382,8 +413,8 @@ class PaintedTitleButton(PaintedButton):
 
 
 class RoundedSection(QWidget):
-    """Antialiased rounded section frame. Replaces QFrame.section so borders
-    don't look jagged on translucent windows."""
+    """Antialiased rounded section frame with subtle glassmorphic depth
+    and specular rim highlight. Modern, premium, and zero CPU overhead."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -408,8 +439,10 @@ class RoundedSection(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         palette = _styles.THEME_PALETTES.get(self._theme, _styles.DARK)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        radius = 8.0
         path = QPainterPath()
-        path.addRoundedRect(rect, 10.0, 10.0)
+        path.addRoundedRect(rect, radius, radius)
+
         if self._matrix_mode:
             # Mostly opaque base; covers the matrix rain that's painted below.
             if self._theme in ("light", "sepia", "solarized_light"):
@@ -418,7 +451,31 @@ class RoundedSection(QWidget):
                 base = QColor(20, 24, 32, 235)
             p.fillPath(path, QBrush(base))
         else:
-            p.fillPath(path, QBrush(parse_rgba(palette["section_bg"])))
+            base_color = parse_rgba(palette["section_bg"])
+            grad = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+            if self._theme in ("light", "sepia", "solarized_light"):
+                grad.setColorAt(0.0, base_color.lighter(103))
+                grad.setColorAt(1.0, base_color.darker(102))
+            else:
+                top_col = QColor(base_color)
+                top_col.setAlpha(min(255, base_color.alpha() + 16))
+                bot_col = QColor(base_color)
+                bot_col.setAlpha(max(0, base_color.alpha() - 4))
+                grad.setColorAt(0.0, top_col)
+                grad.setColorAt(1.0, bot_col)
+            p.fillPath(path, QBrush(grad))
+
+            # Specular top rim highlight (1px subtle glass reflection)
+            if self._theme not in ("light", "sepia", "solarized_light"):
+                p.save()
+                p.setClipPath(path)
+                rim_pen = QPen(QColor(255, 255, 255, 24))
+                rim_pen.setWidthF(1.0)
+                p.setPen(rim_pen)
+                p.drawLine(rect.left() + radius, rect.top() + 0.5,
+                           rect.right() - radius, rect.top() + 0.5)
+                p.restore()
+
         pen = QPen(parse_rgba(palette["section_border"]))
         pen.setWidthF(1.0)
         p.setPen(pen)

@@ -1,5 +1,6 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
-Rotating logger writing to ~/.local/share/macfan-monitor/macfan-monitor.log.
+Rotating logger writing to ~/.local/share/fresh-fan-manager/fresh-fan-manager.log.
 """
 from __future__ import annotations
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Icon rendering for Fresh Fan Manager. We use the same snowflake glyph ❄
 everywhere — taskbar, ALT-TAB, window title, tray — and tint it by CPU
@@ -26,30 +27,49 @@ def _color_for_temp(temp: Optional[float]) -> QColor:
 
 
 def _draw_snowflake(size: int, color: QColor,
-                    manual_ring: bool = False) -> QPixmap:
+                    manual_ring: bool = False,
+                    temp: Optional[float] = None,
+                    show_temp_number: bool = False) -> QPixmap:
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
-    # Snowflake glyph filled as large as the frame allows. 0.96 leaves a
-    # 2-pixel breathing margin at typical tray/menu sizes so the antialiased
-    # edges of the glyph don't get clipped by the icon bounding box.
-    f = QFont()
-    f.setPixelSize(int(size * 0.96))
-    f.setBold(True)
-    p.setFont(f)
-    p.setPen(color)
-    p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "❄")
+    if show_temp_number and temp is not None:
+        # Dynamic text: displays e.g. 42° in the tray icon
+        f = QFont()
+        f.setBold(True)
+        t_int = int(round(temp))
+        t_str = f"{t_int}°"
+        f.setPixelSize(max(10, int(size * 0.52)))
+        p.setFont(f)
+        p.setPen(color)
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, t_str)
 
-    if manual_ring:
-        pen = QPen(QColor("#ffb454"))
-        pen.setWidthF(max(1.5, size * 0.06))
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        m = int(size * 0.06)
-        p.drawEllipse(m, m, size - 2*m, size - 2*m)
+        if manual_ring:
+            pen = QPen(QColor("#ffb454"))
+            pen.setWidthF(max(1.5, size * 0.08))
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            m = max(1, int(size * 0.05))
+            p.drawEllipse(m, m, size - 2 * m, size - 2 * m)
+    else:
+        # Snowflake glyph filled as large as the frame allows.
+        f = QFont()
+        f.setPixelSize(int(size * 0.96))
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(color)
+        p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "❄")
+
+        if manual_ring:
+            pen = QPen(QColor("#ffb454"))
+            pen.setWidthF(max(1.5, size * 0.06))
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            m = int(size * 0.06)
+            p.drawEllipse(m, m, size - 2 * m, size - 2 * m)
 
     p.end()
     return pm
@@ -67,14 +87,15 @@ def app_icon(temp: Optional[float] = None) -> QIcon:
 
 
 def tray_icon(temp: Optional[float] = None,
-              manual_mode: bool = False) -> QIcon:
-    """Tray icon: snowflake colored by temp, with optional manual ring.
-    Provides all common tray pixel sizes including HiDPI multipliers so
-    KDE can pick the largest sharp variant for the panel height."""
+              manual_mode: bool = False,
+              show_temp_number: bool = False) -> QIcon:
+    """Tray icon: snowflake or numeric temp colored by temperature,
+    with optional manual ring."""
     color = _color_for_temp(temp)
     icon = QIcon()
     for s in (16, 22, 24, 32, 40, 48, 64, 96, 128, 256):
-        icon.addPixmap(_draw_snowflake(s, color, manual_ring=manual_mode))
+        icon.addPixmap(_draw_snowflake(s, color, manual_ring=manual_mode,
+                                       temp=temp, show_temp_number=show_temp_number))
     return icon
 
 

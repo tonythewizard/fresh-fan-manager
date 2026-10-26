@@ -1,0 +1,11 @@
+[Unit]
+Description=Fresh Fan Manager Background Daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env fresh-fan-manager --daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+include LICENSE README.md THIRD_PARTY_NOTICES.md HANDOFF.md roadmap.md Makefile PKGBUILD
+include install.sh uninstall.sh
+recursive-include assets *.png
+recursive-include native *.c
+recursive-include bin *helper
+recursive-include autostart *.desktop *.service
+recursive-include policies *.policy
+recursive-include tools *.sh *.py *.spec
+recursive-include tests *.py
+recursive-include docs *.md *.png

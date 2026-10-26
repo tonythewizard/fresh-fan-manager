@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 Matrix-style background overlay. Opt-in only because it animates continuously
 and uses CPU. Kept deliberately light:
