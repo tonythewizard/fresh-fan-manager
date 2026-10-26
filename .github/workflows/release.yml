@@ -7,6 +7,7 @@ on:
     paths:
       - core/version.py
       - .github/workflows/release.yml
+      - tools/fresh-fan-manager.spec
   workflow_dispatch:
 
 permissions:
@@ -85,7 +86,7 @@ jobs:
   rpm:
     needs: tests
     runs-on: ubuntu-latest
-    container: fedora:latest
+    container: fedora:44
     steps:
       - run: dnf install -y gcc make rpm-build python3 tar gzip findutils binutils git
       - uses: actions/checkout@v4

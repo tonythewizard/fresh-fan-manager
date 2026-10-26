@@ -258,6 +258,8 @@ sudo zypper install ./dist/fresh-fan-manager-2.0.0-1.x86_64.rpm
 
 A local build does not publish a GitHub release. Choose a package matching the
 machine's architecture and use the distribution's package manager to resolve dependencies.
+RPM release builds may include a distribution suffix such as `.fc44`; substitute
+the exact downloaded filename in the commands above.
 
 ### Run from a development checkout
 

@@ -29,7 +29,7 @@ and headless background daemon modes.
 
 %build
 %ifarch x86_64
-%{__cc} -O2 -Wall -Wextra -fPIC -shared native/smc_port_lib.c -o libsmc_port.so
+%{__cc} %{optflags} -Wall -Wextra -fPIC -shared native/smc_port_lib.c -o libsmc_port.so %{?build_ldflags}
 %endif
 
 %install
